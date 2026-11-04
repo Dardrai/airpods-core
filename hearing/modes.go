@@ -309,7 +309,7 @@ type ModeResult struct {
 
 // ModeUnconfirmed means packets went out but the AirPods have not confirmed the outcome,
 // so the mode may be in either state. Recovery says what the user should be offered; for
-// an enable it is to turn the mode off with Modes.Recover, which is possible without any
+// an enable it is to turn the mode off with Modes.StartRecover, which is possible without any
 // new report. Nothing is resent automatically.
 type ModeUnconfirmed struct {
 	Mode     Mode
@@ -359,6 +359,9 @@ type Modes struct {
 	profile  *Settings
 	editable bool
 	recovery *Recovery
+
+	change *ModeChange   // under way, between its steps
+	apply  *ProfileApply // under way, between its steps
 }
 
 func (m *Modes) bind(status dongle.Status) {
@@ -369,7 +372,8 @@ func (m *Modes) bind(status dongle.Status) {
 	if m.bound && m.peer == status.Peer {
 		recovery = m.recovery
 	}
-	*m = Modes{bound: true, generation: status.Generation, peer: status.Peer, recovery: recovery}
+	// Work under way stays known, so nothing else starts. Its next step sees the new connection.
+	*m = Modes{bound: true, generation: status.Generation, peer: status.Peer, recovery: recovery, change: m.change, apply: m.apply}
 }
 
 // observeSlot applies a kept report. While a slot is fenced only a report with a new
@@ -468,52 +472,86 @@ func (m *Modes) Plan(mode Mode, on bool) (*ModePlan, error) {
 // when the mode is next confirmed.
 func (m *Modes) Recovery() *Recovery { return m.recovery }
 
-// Set turns Hearing Aid or Media Assist on or off, without writing the stored profile.
-// Everything is checked on fresh reports inside one lease, before any packet. A failed check
-// is a *Refused; a failed read during the checks comes back as it is, also before any packet:
+// Set turns Hearing Aid or Media Assist on or off, without writing the stored profile. It is
+// StartSet followed by Step until done, blocking for up to 15 s with exclusive use of the
+// client. An app with a device owner goroutine that also polls should not run it as one job:
+// use StartSet and one job per Step instead. The checks and the outcomes are those of StartSet.
+func (m *Modes) Set(c *dongle.Client, mode Mode, on bool) (*ModeResult, error) {
+	change, err := m.StartSet(c, mode, on)
+	if err != nil {
+		return nil, err
+	}
+	return change.wait(c)
+}
+
+// Recover turns off the mode named by Recovery. It is StartRecover followed by Step until
+// done, blocking for up to 15 s as Set does.
+func (m *Modes) Recover(c *dongle.Client) (*ModeResult, error) {
+	change, err := m.StartRecover(c)
+	if err != nil {
+		return nil, err
+	}
+	return change.wait(c)
+}
+
+// StartSet begins turning Hearing Aid or Media Assist on or off, without writing the stored
+// profile. Everything is checked on fresh reports inside one lease, before any packet, and
+// the lease is released before it returns. A failed check is a *Refused; a failed read during
+// the checks comes back as it is, also before any packet:
 //   - the model must have hearing assistance;
 //   - enabling needs enrollment and complete, consistent mode reports;
 //   - enabling reads the stored profile first, and refuses unless Custom Transparency is
 //     known to be off (skipped only for Hearing Aid when it is already reported on);
-//   - the reports must not change during those reads.
+//   - the reports must not change during those reads;
+//   - no other change on this Modes may be under way.
 //
-// Packets go out once. A nil error means the AirPods reported the planned state with new
-// reception revisions and, after an enable, the stored profile read back byte for byte. A
-// *ModeUnconfirmed means the state is unknown: offer Modes.Recover, and do not call Set
-// again on its own.
+// Packets go out once, here. Step then follows the outcome and never sends a packet. A
+// *ModeUnconfirmed, from here or from Step, means the state is unknown: offer StartRecover,
+// and do not call StartSet again on its own.
 //
 // Gating: model.Profile.HearingAid is enforced here. Callers keep this behind the
 // experimental switch, since it changes how loud sound is presented and has not run on real
-// AirPods. Blocking for up to 15 s; run it on the device owner goroutine.
-func (m *Modes) Set(c *dongle.Client, mode Mode, on bool) (*ModeResult, error) {
+// AirPods. Blocking for a moment; run it on the device owner goroutine.
+func (m *Modes) StartSet(c *dongle.Client, mode Mode, on bool) (*ModeChange, error) {
 	if mode != HearingAid && mode != MediaAssist {
 		return nil, refuse("Unknown hearing mode.")
+	}
+	if err := m.requireIdle(); err != nil {
+		return nil, err
 	}
 	o, err := m.beginHearing(c)
 	if err != nil {
 		return nil, err
 	}
 	defer o.close()
-	result, err := m.setMode(o, mode, on)
+	change, err := m.startChange(o, mode, on)
 	if err != nil {
 		m.editable = false
 	}
-	return result, err
+	return change, err
 }
 
-// Recover turns off the mode named by Recovery, using the last good packets if the AirPods
-// have not reported since. It runs the same checks and confirmation as Set(mode, false),
-// and it is an explicit user action, never automatic.
+// StartRecover begins turning off the mode named by Recovery, using the last good packets if
+// the AirPods have not reported since. It runs the same checks and confirmation as
+// StartSet(mode, false), and it is an explicit user action, never automatic.
 //
-// Gating: as for Set. Blocking for up to 15 s; run it on the device owner goroutine.
-func (m *Modes) Recover(c *dongle.Client) (*ModeResult, error) {
+// Gating: as for StartSet. Blocking for a moment; run it on the device owner goroutine.
+func (m *Modes) StartRecover(c *dongle.Client) (*ModeChange, error) {
 	if m.recovery == nil {
 		return nil, refuse("There is no hearing mode change to recover from.")
 	}
-	return m.Set(c, m.recovery.Mode, false)
+	return m.StartSet(c, m.recovery.Mode, false)
 }
 
-func (m *Modes) setMode(o *operation, mode Mode, on bool) (*ModeResult, error) {
+func (m *Modes) requireIdle() error {
+	if m.change != nil || m.apply != nil {
+		return refuse("A hearing change is still being confirmed. Wait for it to finish.")
+	}
+	return nil
+}
+
+// startChange checks and sends one change inside the caller's lease.
+func (m *Modes) startChange(o *operation, mode Mode, on bool) (*ModeChange, error) {
 	if err := o.check(); err != nil {
 		return nil, err
 	}
@@ -550,15 +588,150 @@ func (m *Modes) setMode(o *operation, mode Mode, on bool) (*ModeResult, error) {
 			return nil, refuse("The current hearing modes are not known yet. Read them first.")
 		}
 	}
-	result, err := m.applyPlan(o, plan, original)
+	change := &ModeChange{modes: m, plan: plan, original: original, start: o.start, deadline: o.deadline}
+	if err := m.sendPlan(o, plan); err != nil {
+		_, _, err = change.end(nil, err)
+		return nil, err
+	}
+	change.confirmBy = o.clock.Now().Add(confirmLimit)
+	m.change = change
+	return change, nil
+}
+
+// sendPlan sends the plan once. Nothing here is ever repeated.
+func (m *Modes) sendPlan(o *operation, plan *ModePlan) error {
+	for _, packet := range plan.packets {
+		if slot, ok := slotOf(packet); ok {
+			i := slot - dongle.SlotHearingAid
+			m.fences[i], m.fenced[i] = m.revisions[i], true
+			m.cache.invalidate(slot)
+		}
+		if err := o.SendAAP(packet); err != nil {
+			return fmt.Errorf("The hearing mode change was interrupted, so its state is unknown: %w", err)
+		}
+	}
+	if len(plan.packets) > 0 {
+		// This only asks for reports. It does not stand in for reading them.
+		if err := o.SendAAP(requestReports); err != nil {
+			return fmt.Errorf("The hearing mode change was sent, but its state is unknown: %w", err)
+		}
+	}
+	return nil
+}
+
+// ModeChange follows one change that StartSet sent. Each Step is its own short device owner
+// job with its own short lease, and the owner stays free in between, so status polling goes on
+// through the whole wait. Its methods must not run concurrently, nor alongside other methods
+// of the Modes it came from. While it runs, the Modes refuses to start another change.
+type ModeChange struct {
+	modes     *Modes
+	plan      *ModePlan
+	original  []byte
+	start     dongle.Status
+	deadline  time.Time
+	confirmBy time.Time
+	ended     bool
+	result    *ModeResult
+	err       error
+}
+
+// wait runs the steps one after the other, for the blocking calls.
+func (ch *ModeChange) wait(c *dongle.Client) (*ModeResult, error) {
+	for {
+		result, done, err := ch.Step(c)
+		if done {
+			return result, err
+		}
+		c.Clock().Sleep(confirmPoll)
+	}
+}
+
+// Step looks once at the change and returns without waiting. done means it has ended: a nil
+// error says the AirPods reported the planned state with new reception revisions and, after an
+// enable, that the stored profile read back byte for byte. A connection that changes, a
+// recording that starts or a failed read ends it as a *ModeUnconfirmed, as does the 15 s limit.
+// Another client holding the channel only delays the look, within that limit. It sends nothing
+// to the AirPods. Run it on the device owner goroutine, every 100 ms or more.
+func (ch *ModeChange) Step(c *dongle.Client) (*ModeResult, bool, error) {
+	if ch.ended {
+		return ch.result, true, ch.err
+	}
+	m := ch.modes
+	o, err := reopenOperation(c, ch.start, ch.deadline)
+	if err != nil {
+		return ch.endUnlessBusy(c, err)
+	}
+	defer o.close()
+	if err := m.refresh(o); err != nil {
+		return ch.endUnlessBusy(c, err)
+	}
+	if !ch.plan.confirmed(&m.cache) {
+		if !o.clock.Now().Before(ch.confirmBy) {
+			return ch.end(nil, errors.New("The hearing mode change was sent, but the AirPods did not confirm it. Reconnect the AirPods and read the state again."))
+		}
+		return nil, false, nil
+	}
+	result := &ModeResult{Sent: len(ch.plan.packets) > 0}
+	if ch.original != nil {
+		characteristic, value, settings, err := readSettings(o.Exchange)
+		if err != nil {
+			return ch.endUnlessBusy(c, err)
+		}
+		if !bytes.Equal(value, ch.original) {
+			return ch.end(nil, errors.New("The stored hearing profile is no longer the one read at the start. Read it again."))
+		}
+		if err := m.refresh(o); err != nil {
+			return ch.endUnlessBusy(c, err)
+		}
+		if !ch.plan.confirmed(&m.cache) {
+			return ch.end(nil, errors.New("The hearing modes changed before the request finished. Read them again."))
+		}
+		m.profile, m.editable = &settings, editableValue(value, characteristic)
+		result.Profile = &Profile{Settings: settings, Editable: m.editable}
+	}
+	result.State = m.cache.state()
+	return ch.end(result, nil)
+}
+
+// Absent stands in for Step when the owner has no device to run it with. The outcome cannot
+// be followed any further, so it ends the change as Step would on a failed read, with cause.
+// Nothing touches the device. Run it where Step would run.
+func (ch *ModeChange) Absent(cause error) (*ModeResult, bool, error) {
+	if ch.ended {
+		return ch.result, true, ch.err
+	}
+	return ch.end(nil, cause)
+}
+
+// endUnlessBusy lets a look wait while another client holds the channel: this change gave up
+// the lease between steps, and being asked to wait says nothing about its outcome.
+func (ch *ModeChange) endUnlessBusy(c *dongle.Client, err error) (*ModeResult, bool, error) {
+	var rejected *dongle.RequestRejected
+	if errors.As(err, &rejected) && rejected.Code == 2 && c.Clock().Now().Before(ch.confirmBy) {
+		return nil, false, nil
+	}
+	return ch.end(nil, err)
+}
+
+// end records the outcome. Once packets went out, a failure means the state is unknown.
+func (ch *ModeChange) end(result *ModeResult, err error) (*ModeResult, bool, error) {
+	m := ch.modes
+	ch.ended = true
+	if m.change == ch {
+		m.change = nil
+	}
+	mode, on := ch.plan.Mode, ch.plan.On
 	if err == nil {
 		if m.recovery != nil && m.recovery.Mode == mode {
 			m.recovery = nil
 		}
-		return result, nil
+		ch.result = result
+		return result, true, nil
 	}
-	if len(plan.packets) == 0 {
-		return nil, err
+	m.editable = false
+	if len(ch.plan.packets) == 0 {
+		ch.err = err
+		return nil, true, err
 	}
 	if on {
 		m.recovery = &Recovery{Mode: mode}
@@ -567,61 +740,6 @@ func (m *Modes) setMode(o *operation, mode Mode, on bool) (*ModeResult, error) {
 	if m.recovery != nil && m.recovery.Mode == mode {
 		recovery = m.recovery
 	}
-	return nil, &ModeUnconfirmed{Mode: mode, On: on, Recovery: recovery, Message: err.Error(), Err: err}
-}
-
-// applyPlan sends the plan once and waits for the AirPods to report its outcome.
-func (m *Modes) applyPlan(o *operation, plan *ModePlan, original []byte) (*ModeResult, error) {
-	for _, packet := range plan.packets {
-		if slot, ok := slotOf(packet); ok {
-			i := slot - dongle.SlotHearingAid
-			m.fences[i], m.fenced[i] = m.revisions[i], true
-			m.cache.invalidate(slot)
-		}
-		if err := o.SendAAP(packet); err != nil {
-			return nil, fmt.Errorf("The hearing mode change was interrupted, so its state is unknown: %w", err)
-		}
-	}
-	if len(plan.packets) > 0 {
-		// This only asks for reports. It does not stand in for reading them.
-		if err := o.SendAAP(requestReports); err != nil {
-			return nil, fmt.Errorf("The hearing mode change was sent, but its state is unknown: %w", err)
-		}
-	}
-	deadline := o.clock.Now().Add(confirmLimit)
-	for {
-		if err := o.check(); err != nil {
-			return nil, err
-		}
-		if err := m.refresh(o); err != nil {
-			return nil, err
-		}
-		if plan.confirmed(&m.cache) {
-			break
-		}
-		if !o.clock.Now().Before(deadline) {
-			return nil, errors.New("The hearing mode change was sent, but the AirPods did not confirm it. Reconnect the AirPods and read the state again.")
-		}
-		o.clock.Sleep(confirmPoll)
-	}
-	result := &ModeResult{Sent: len(plan.packets) > 0}
-	if original != nil {
-		c, value, settings, err := readSettings(o.Exchange)
-		if err != nil {
-			return nil, err
-		}
-		if !bytes.Equal(value, original) {
-			return nil, errors.New("The stored hearing profile is no longer the one read at the start. Read it again.")
-		}
-		if err := m.refresh(o); err != nil {
-			return nil, err
-		}
-		if !plan.confirmed(&m.cache) {
-			return nil, errors.New("The hearing modes changed before the request finished. Read them again.")
-		}
-		m.profile, m.editable = &settings, editableValue(value, c)
-		result.Profile = &Profile{Settings: settings, Editable: m.editable}
-	}
-	result.State = m.cache.state()
-	return result, nil
+	ch.err = &ModeUnconfirmed{Mode: mode, On: on, Recovery: recovery, Message: err.Error(), Err: err}
+	return nil, true, ch.err
 }

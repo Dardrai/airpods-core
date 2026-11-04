@@ -13,7 +13,7 @@ const (
 	readbackWait  = 75 * time.Millisecond
 )
 
-// ReadProfile reads the stored hearing profile, which becomes the baseline ApplyProfile
+// ReadProfile reads the stored hearing profile, which becomes the baseline StartApplyProfile
 // requires. It writes nothing and does not enable anything.
 //
 // Gating: model.Profile.HearingAid is enforced here. Callers keep this behind the
@@ -62,7 +62,7 @@ func (m *Modes) requireBaseline(expected, requested Settings) error {
 // PrepareProfile checks that ApplyProfile would start from expected, on a fresh read, without
 // changing anything. WillEnable warns that applying would turn Hearing Aid on.
 //
-// Gating: as for ApplyProfile. Blocking; run it on the device owner goroutine.
+// Gating: as for StartApplyProfile. Blocking; run it on the device owner goroutine.
 func (m *Modes) PrepareProfile(c *dongle.Client, expected Settings) (*PreparedProfile, error) {
 	o, err := m.beginHearing(c)
 	if err != nil {
@@ -166,24 +166,74 @@ type ProfileResult struct {
 	Enabled bool
 }
 
-// ApplyProfile writes a hearing profile, once, as an explicit user action. expected must be
-// what ReadProfile returned on this connection; the stored record is read again before the
-// write and must still equal it, and the whole record must read back afterwards. Fields the
-// profile does not model are kept byte for byte.
+// ApplyProfile writes a hearing profile. It is StartApplyProfile followed by Step until done,
+// blocking for up to about 30 s with exclusive use of the client. An app with a device owner
+// goroutine that also polls should not run it as one job: use StartApplyProfile and one job per
+// Step instead. The checks and the outcomes are those of StartApplyProfile.
+func (m *Modes) ApplyProfile(c *dongle.Client, expected, requested Settings) (*ProfileResult, error) {
+	apply, err := m.StartApplyProfile(c, expected, requested)
+	if err != nil {
+		return nil, err
+	}
+	for {
+		result, done, err := apply.Step(c)
+		if done {
+			return result, err
+		}
+		c.Clock().Sleep(confirmPoll)
+	}
+}
+
+type applyPhase int
+
+const (
+	applyEnabling applyPhase = iota
+	applyWriting
+	applyDisabling
+	applyFinished
+)
+
+// ProfileApply follows one profile write through its steps. Each Step is its own short device
+// owner job with its own short lease, and the owner stays free in between. Its methods must not
+// run concurrently, nor alongside other methods of the Modes it came from. While it runs, the
+// Modes refuses to start another change.
+type ProfileApply struct {
+	modes         *Modes
+	expected      Settings
+	requested     Settings
+	enable        bool
+	start         dongle.Status
+	deadline      time.Time
+	writeBy       time.Time
+	phase         applyPhase
+	change        *ModeChange
+	enableStarted bool
+	cause         error
+	result        *ProfileResult
+	err           error
+}
+
+// StartApplyProfile begins writing a hearing profile, once, as an explicit user action.
+// expected must be what ReadProfile returned on this connection; the stored record is read
+// again before the write and must still equal it, and the whole record must read back
+// afterwards. Fields the profile does not model are kept byte for byte.
 //
-// The profile can only be written with Hearing Aid on, so if it is off this runs Set's full
-// enable, with its enrollment and Custom Transparency checks, and it stays on after success.
-// If anything fails after that enable, one attempt is made to turn it off again and the
-// error says how that went; the profile write itself is never repeated.
+// The profile can only be written with Hearing Aid on, so if it is off this begins StartSet's
+// full enable, with its enrollment and Custom Transparency checks, and it stays on after
+// success. If anything fails after that enable, one attempt is made to turn it off again and
+// the error says how that went; the profile write itself is never repeated.
 //
-// Errors: *Refused means nothing changed. *dongle.Unconfirmed and *ModeUnconfirmed mean the
-// outcome is unknown: read again before doing anything else, and offer Modes.Recover when
-// Modes.Recovery returns one.
+// Errors, from here or from Step: *Refused means nothing changed. *dongle.Unconfirmed and
+// *ModeUnconfirmed mean the outcome is unknown: read again before doing anything else, and offer
+// Modes.StartRecover when Modes.Recovery returns one.
 //
 // Gating: model.Profile.HearingAid is enforced here. Callers keep this behind the
 // experimental switch, since it changes how loud sound is presented. UNVERIFIED on real
-// AirPods. Blocking for up to 60 s; run it on the device owner goroutine.
-func (m *Modes) ApplyProfile(c *dongle.Client, expected, requested Settings) (*ProfileResult, error) {
+// AirPods. Blocking for a moment; run it on the device owner goroutine.
+func (m *Modes) StartApplyProfile(c *dongle.Client, expected, requested Settings) (*ProfileApply, error) {
+	if err := m.requireIdle(); err != nil {
+		return nil, err
+	}
 	o, err := m.beginHearing(c)
 	if err != nil {
 		return nil, err
@@ -204,62 +254,189 @@ func (m *Modes) ApplyProfile(c *dongle.Client, expected, requested Settings) (*P
 	if was == FlagUnknown {
 		return nil, refuse("Wait for the AirPods to report Hearing Aid before editing.")
 	}
-	enableStarted := false
-	result, err := func() (*ProfileResult, error) {
-		if was != FlagOn {
-			_, err := m.setMode(o, HearingAid, true)
+	a := &ProfileApply{
+		modes: m, expected: expected, requested: requested, enable: was != FlagOn,
+		start: o.start, deadline: o.deadline, writeBy: o.clock.Now().Add(confirmLimit), phase: applyWriting,
+	}
+	if a.enable {
+		a.phase = applyEnabling
+		a.change, err = m.startChange(o, HearingAid, true)
+		if err != nil {
 			var partial *ModeUnconfirmed
-			enableStarted = err == nil || errors.As(err, &partial)
-			if err != nil {
+			a.enableStarted = errors.As(err, &partial)
+			if !a.enableStarted {
+				m.editable = false
 				return nil, err
 			}
+			if _, done, stepErr := a.failed(o, err); done {
+				return nil, stepErr
+			}
+		} else {
+			a.enableStarted = true
 		}
-		modes := m.cache.state()
-		characteristic, baseline, err := prepare(o.Exchange, expected)
-		if err != nil {
-			return nil, err
-		}
-		if err := m.refresh(o); err != nil {
-			return nil, err
-		}
-		if state := m.cache.state(); state != modes || state.HearingEnabled != FlagOn {
-			return nil, refuse("The hearing modes changed before the profile write. Read the settings again.")
-		}
-		m.editable = false
-		confirmed, err := writeSettings(o.Exchange, o.clock, characteristic, baseline, requested)
-		if err != nil {
-			return nil, err
-		}
-		if err := m.refresh(o); err != nil {
-			return nil, unconfirmed("The profile was written, but the hearing modes could not be read. Read the settings again.", err)
-		}
-		if state := m.cache.state(); state != modes {
-			return nil, unconfirmed("The profile was written, but the hearing modes changed. Read the settings again.", nil)
-		}
-		m.profile, m.editable = &confirmed, true
-		return &ProfileResult{Settings: confirmed, State: m.cache.state(), Enabled: was != FlagOn}, nil
-	}()
-	if err == nil {
-		return result, nil
 	}
-	m.editable = false
-	if !enableStarted {
+	m.apply = a
+	return a, nil
+}
+
+// Step does the next short piece of the work and returns without waiting. done means it has
+// ended. The profile write goes out at most once, from one Step. Run it on the device owner
+// goroutine, every 100 ms or more.
+func (a *ProfileApply) Step(c *dongle.Client) (*ProfileResult, bool, error) {
+	switch a.phase {
+	case applyEnabling:
+		_, done, err := a.change.Step(c)
+		if !done {
+			return nil, false, nil
+		}
+		a.change = nil
+		if err != nil {
+			var partial *ModeUnconfirmed
+			a.enableStarted = errors.As(err, &partial)
+			return a.failedOpening(c, err)
+		}
+		a.phase, a.writeBy = applyWriting, c.Clock().Now().Add(confirmLimit)
+		return nil, false, nil
+	case applyWriting:
+		o, err := reopenOperation(c, a.start, a.deadline)
+		if err != nil {
+			var rejected *dongle.RequestRejected
+			if errors.As(err, &rejected) && rejected.Code == 2 && c.Clock().Now().Before(a.writeBy) {
+				return nil, false, nil // Nothing was written, and another client holds the channel.
+			}
+			return a.failedOpening(c, err)
+		}
+		defer o.close()
+		result, err := a.write(o)
+		if err != nil {
+			return a.failed(o, err)
+		}
+		return a.finish(result, nil)
+	case applyDisabling:
+		_, done, err := a.change.Step(c)
+		if !done {
+			return nil, false, nil
+		}
+		a.change = nil
+		if err != nil {
+			return a.mayBeActive(err)
+		}
+		a.modes.recovery = nil
+		return a.finish(nil, &noted{a.cause, "Hearing Aid is confirmed off again."})
+	}
+	return a.result, true, a.err
+}
+
+// Absent stands in for Step when the owner has no device to run it with. The work cannot go on
+// or be undone, so it ends, saying what may be left on. No write goes out and nothing touches
+// the device. Run it where Step would run.
+func (a *ProfileApply) Absent(cause error) (*ProfileResult, bool, error) {
+	switch a.phase {
+	case applyEnabling:
+		_, _, err := a.change.Absent(cause)
+		a.change = nil
+		var partial *ModeUnconfirmed
+		a.enableStarted = errors.As(err, &partial)
+		a.cause = err
+		if !a.enableStarted {
+			return a.finish(nil, err)
+		}
+		return a.mayBeActive(cause)
+	case applyWriting:
+		a.cause = cause
+		if !a.enableStarted {
+			return a.finish(nil, cause)
+		}
+		return a.mayBeActive(cause)
+	case applyDisabling:
+		_, _, _ = a.change.Absent(cause)
+		a.change = nil
+		return a.mayBeActive(cause)
+	}
+	return a.result, true, a.err
+}
+
+// write is the one piece that sends the profile, under one lease.
+func (a *ProfileApply) write(o *operation) (*ProfileResult, error) {
+	m := a.modes
+	if err := m.refresh(o); err != nil {
 		return nil, err
 	}
-	if checkErr := o.check(); checkErr != nil {
-		m.recovery = &Recovery{Mode: HearingAid}
-		return nil, &noted{err, "Hearing Aid may still be active: " + checkErr.Error()}
+	modes := m.cache.state()
+	characteristic, baseline, err := prepare(o.Exchange, a.expected)
+	if err != nil {
+		return nil, err
 	}
-	if _, offErr := m.setMode(o, HearingAid, false); offErr != nil {
-		m.recovery = &Recovery{Mode: HearingAid}
-		return nil, &noted{err, "Hearing Aid may still be active: " + offErr.Error()}
+	if err := m.refresh(o); err != nil {
+		return nil, err
 	}
-	m.recovery = nil
-	return nil, &noted{err, "Hearing Aid is confirmed off again."}
+	if state := m.cache.state(); state != modes || state.HearingEnabled != FlagOn {
+		return nil, refuse("The hearing modes changed before the profile write. Read the settings again.")
+	}
+	m.editable = false
+	confirmed, err := writeSettings(o.Exchange, o.clock, characteristic, baseline, a.requested)
+	if err != nil {
+		return nil, err
+	}
+	if err := m.refresh(o); err != nil {
+		return nil, unconfirmed("The profile was written, but the hearing modes could not be read. Read the settings again.", err)
+	}
+	if state := m.cache.state(); state != modes {
+		return nil, unconfirmed("The profile was written, but the hearing modes changed. Read the settings again.", nil)
+	}
+	m.profile, m.editable = &confirmed, true
+	return &ProfileResult{Settings: confirmed, State: m.cache.state(), Enabled: a.enable}, nil
+}
+
+// failedOpening is failed for a step that holds no lease yet.
+func (a *ProfileApply) failedOpening(c *dongle.Client, cause error) (*ProfileResult, bool, error) {
+	a.modes.editable = false
+	a.cause = cause
+	if !a.enableStarted {
+		return a.finish(nil, cause)
+	}
+	o, err := reopenOperation(c, a.start, a.deadline)
+	if err != nil {
+		return a.mayBeActive(err)
+	}
+	defer o.close()
+	return a.failed(o, cause)
+}
+
+// failed makes the one attempt to undo an enable that this apply began.
+func (a *ProfileApply) failed(o *operation, cause error) (*ProfileResult, bool, error) {
+	m := a.modes
+	m.editable = false
+	a.cause = cause
+	if !a.enableStarted {
+		return a.finish(nil, cause)
+	}
+	change, err := m.startChange(o, HearingAid, false)
+	if err != nil {
+		return a.mayBeActive(err)
+	}
+	a.change, a.phase = change, applyDisabling
+	return nil, false, nil
+}
+
+func (a *ProfileApply) mayBeActive(reason error) (*ProfileResult, bool, error) {
+	a.modes.recovery = &Recovery{Mode: HearingAid}
+	return a.finish(nil, &noted{a.cause, "Hearing Aid may still be active: " + reason.Error()})
+}
+
+func (a *ProfileApply) finish(result *ProfileResult, err error) (*ProfileResult, bool, error) {
+	a.phase, a.result, a.err = applyFinished, result, err
+	if a.modes.apply == a {
+		a.modes.apply = nil
+	}
+	if err != nil {
+		a.modes.editable = false
+	}
+	return result, true, err
 }
 
 // ProfileEdit is a draft of a profile being edited, with the combined sliders. Nothing here
-// talks to the device; pass Baseline and Draft to Modes.ApplyProfile.
+// talks to the device; pass Baseline and Draft to Modes.StartApplyProfile.
 //
 // Amplification runs 0 to 1 and Balance -1 to 1. Each ear's stored gain is
 // amplification*2-1 minus or plus balance*0.5, clamped to -1.5 to 1.5. Stored gains stay

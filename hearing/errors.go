@@ -77,6 +77,22 @@ func openOperation(c *dongle.Client) (*operation, error) {
 	return &operation{client: c, session: session, start: status, clock: clock, deadline: clock.Now().Add(operationLimit)}, nil
 }
 
+// reopenOperation takes a new lease for a later step of one request. The step still belongs
+// to the connection the request began on and to its deadline, so a reconnect between two steps
+// ends the work just as one inside a lease does.
+func reopenOperation(c *dongle.Client, start dongle.Status, deadline time.Time) (*operation, error) {
+	o, err := openOperation(c)
+	if err != nil {
+		return nil, err
+	}
+	o.start, o.deadline = start, deadline
+	if err := o.check(); err != nil {
+		o.close()
+		return nil, err
+	}
+	return o, nil
+}
+
 func (o *operation) close() { o.session.Close() }
 
 func (o *operation) check() error {
