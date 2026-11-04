@@ -77,7 +77,8 @@ var Settings = []Setting{
 	{Name: "hold-actions", Control: 0x16, Kind: KindActions},
 }
 
-// ExtraSettings are tray-only: never listed or accepted by the CLI's get and set.
+// ExtraSettings are settings kept apart from Settings, in the same form. The CLI and the tray
+// both list and accept them; LookupAnySetting finds them.
 var ExtraSettings = []Setting{
 	{Name: "connect-automatically", Control: 0x20, Values: toggle},
 	{Name: "allow-auto-connect", Control: 0x36, Values: toggle},
