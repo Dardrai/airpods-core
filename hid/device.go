@@ -1,0 +1,67 @@
+// Package hid is the transport to the dongle's vendor HID collection: 64-byte
+// feature reports 2 and 3 with the header report,'A','P','D','G',1,64.
+package hid
+
+import "errors"
+
+const (
+	// ReportSize is the length of every feature report, including the report ID.
+	ReportSize = 64
+	// VendorID is the dongle's USB vendor ID.
+	VendorID = 0xcafe
+	// ProductAudio is the audio composite mode's product ID.
+	ProductAudio = 0x4015
+	// ProductControl is the control-only mode's product ID.
+	ProductControl = 0x4005
+)
+
+// Device is one opened dongle. Get verifies the report identity; implementations
+// are not safe for concurrent use.
+type Device interface {
+	Get(report byte) ([ReportSize]byte, error)
+	Set(data [ReportSize]byte) error
+	Serial() string
+	Close() error
+}
+
+// ErrUnsupportedReport is returned by Get when the report identity or protocol
+// version is not the one this tool speaks.
+var ErrUnsupportedReport = errors.New("Unsupported HID report identity/version")
+
+// Header returns the seven identity bytes of a report.
+func Header(report byte) [7]byte {
+	return [7]byte{report, 'A', 'P', 'D', 'G', 1, ReportSize}
+}
+
+// CheckReport verifies data[:7] against the report's identity and version.
+func CheckReport(report byte, data [ReportSize]byte) error {
+	if [7]byte(data[:7]) != Header(report) {
+		return ErrUnsupportedReport
+	}
+	return nil
+}
+
+func isProduct(vid, pid uint16) bool {
+	return vid == VendorID && (pid == ProductAudio || pid == ProductControl)
+}
+
+// MatchError is Open failing the exactly-one-match rule. Found tells no dongle from
+// several.
+type MatchError struct {
+	Found int
+	Text  string
+}
+
+func (e *MatchError) Error() string { return e.Text }
+
+// exactlyOne keeps the single match or closes every candidate and fails with msg.
+func exactlyOne[T any](found []T, closeFn func(T), msg string) (T, error) {
+	if len(found) != 1 {
+		for _, item := range found {
+			closeFn(item)
+		}
+		var zero T
+		return zero, &MatchError{Found: len(found), Text: msg}
+	}
+	return found[0], nil
+}
