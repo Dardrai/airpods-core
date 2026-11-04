@@ -121,7 +121,7 @@ func readSysfsUevent(node string) (string, error) {
 }
 
 func permissionError(node string) error {
-	return fmt.Errorf("found %s but no permission to open it; install the udev rule 70-airpods-hid.rules", node)
+	return fmt.Errorf("found %s but no permission to open it; install the AirPods udev rule; see the docs", node)
 }
 
 // ueventUniq reads the USB serial from a hidraw node's sysfs uevent text.

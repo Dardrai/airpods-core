@@ -147,7 +147,7 @@ func TestDeniedDongleIsNamedOnlyWhenSysfsSaysItIsTheDongle(t *testing.T) {
 	if got := deniedDongle(nil, read); got != "" {
 		t.Errorf("no denied nodes: %q", got)
 	}
-	want := "found /dev/hidraw3 but no permission to open it; install the udev rule 70-airpods-hid.rules"
+	want := "found /dev/hidraw3 but no permission to open it; install the AirPods udev rule; see the docs"
 	if got := permissionError("/dev/hidraw3").Error(); got != want {
 		t.Errorf("text %q", got)
 	}
