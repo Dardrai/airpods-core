@@ -11,6 +11,8 @@ Go library for the Pico 2 W AirPods USB dongle. It is the shared protocol code o
 | `dongle` | Status, control commands, settings, sessions, kept reports and diagnostics |
 | `dongle/sim` | A simulated dongle for tests and for trying an app without hardware |
 | `disconnect` | Ends the AirPods connection while keeping them paired, on dongles that can |
+| `model` | What each AirPods model can do, and which settings and values to offer it |
+| `hearing` | Hearing modes and profile, the in-case check, and experimental requests |
 
 It is pure Go and depends only on `golang.org/x/sys`.
 
