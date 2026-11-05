@@ -15,7 +15,9 @@ func TestWinErrorKeepsIdentity(t *testing.T) {
 		kind error
 	}{
 		{windows.ERROR_DEVICE_NOT_CONNECTED, ErrDisconnected},
-		{windows.ERROR_GEN_FAILURE, ErrDisconnected},
+		{windows.ERROR_DEVICE_REMOVED, ErrDisconnected},
+		// A stalled feature request on an attached dongle fails this way too.
+		{windows.ERROR_GEN_FAILURE, nil},
 		{windows.ERROR_SEM_TIMEOUT, ErrTimeout},
 		{windows.ERROR_ACCESS_DENIED, nil},
 	} {

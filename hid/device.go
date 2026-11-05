@@ -36,7 +36,9 @@ var ErrUnsupportedReport = errors.New("Unsupported HID report identity/version")
 // Conditions that apply on every platform. errors.Is finds them in the errors of Get, Set
 // and Open, which keep their own text and still wrap the OS error underneath.
 var (
-	// ErrDisconnected means the device went away; a new Open is the only way back.
+	// ErrDisconnected means the device went away; a new Open is the only way back. A failure
+	// without it is no proof the device is still there: Windows reports some transfers to a
+	// missing device as a general failure, the same as a request the device stalled.
 	ErrDisconnected = errors.New("HID device disconnected")
 	// ErrTimeout means one transfer ran out of time. It may still have reached the device.
 	ErrTimeout = errors.New("HID transfer timed out")
