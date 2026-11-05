@@ -279,7 +279,9 @@ const (
 	settingConfirmPoll = 100 * time.Millisecond
 )
 
-// SettingsClient reads and writes settings within one connection generation.
+// SettingsClient reads and writes settings within one connection generation. Only the generation
+// is pinned: Set and Send read the status again for their preconditions, so a client kept
+// across a microphone start or a settings connection coming up acts on the current state.
 type SettingsClient struct {
 	client     *Client
 	status     Status
@@ -295,10 +297,28 @@ func (c *Client) SettingsClient() (*SettingsClient, error) {
 	return &SettingsClient{client: c, status: status, generation: status.Generation}, nil
 }
 
-// Status returns the status read when the client was created.
+// Status returns the status read when the client was created. Client.Status reads a current one.
 func (s *SettingsClient) Status() Status { return s.status }
 
-// Read returns the current settings snapshot keyed by control ID.
+// writable reads the status again and applies the preconditions of a write.
+func (s *SettingsClient) writable() (Status, error) {
+	status, err := s.client.Status()
+	if err != nil {
+		return status, err
+	}
+	switch {
+	case status.Generation != s.generation:
+		return status, ErrGenerationChanged
+	case !status.ControlsReady:
+		return status, ErrNotReady
+	case status.MicrophoneActive:
+		return status, ErrMicrophoneActive
+	}
+	return status, nil
+}
+
+// Read returns the current settings snapshot keyed by control ID. A dongle's capabilities are
+// fixed for a generation, so this does not read the status again just to check them.
 func (s *SettingsClient) Read() (map[byte]Record, error) {
 	if s.status.Capabilities&CapSettings == 0 {
 		return nil, errors.New("Firmware does not advertise typed settings support")
@@ -320,11 +340,8 @@ func (s *SettingsClient) Set(name string, value uint32) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("unknown setting: %s", name)
 	}
-	if !s.status.ControlsReady {
-		return "", ErrNotReady
-	}
-	if s.status.MicrophoneActive {
-		return "", ErrMicrophoneActive
+	if _, err := s.writable(); err != nil {
+		return "", err
 	}
 	values, err := s.Read()
 	if err != nil {
@@ -366,13 +383,11 @@ func (s *SettingsClient) Send(name string, value uint32) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("unknown setting: %s", name)
 	}
-	if !s.status.ControlsReady {
-		return "", ErrNotReady
+	status, err := s.writable()
+	if err != nil {
+		return "", err
 	}
-	if s.status.MicrophoneActive {
-		return "", ErrMicrophoneActive
-	}
-	if s.status.Capabilities&CapSettings == 0 {
+	if status.Capabilities&CapSettings == 0 {
 		return "", errors.New("Firmware does not advertise typed settings support")
 	}
 	if err := s.write(name, setting.Control, value); err != nil {

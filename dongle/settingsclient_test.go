@@ -142,7 +142,8 @@ func TestPreconditions(t *testing.T) {
 		if _, err := settings.Set("mode", 1); err == nil || err.Error() != want {
 			t.Errorf("flags %#x: %v", flags, err)
 		}
-		if ops, _ := device.TraceSummary(); ops != 1 {
+		// The client's own status read and the fresh one, nothing more.
+		if ops, _ := device.TraceSummary(); ops != 2 {
 			t.Errorf("flags %#x: %d operations", flags, ops)
 		}
 	}
@@ -201,8 +202,8 @@ func TestSendChecksTheSameGatesAsSet(t *testing.T) {
 	}
 }
 
-// TestWriteFailuresBeforeAnythingWasSentAreNotUnconfirmed counts on Send's order: the
-// request's own G2 and G3, then the G2 just before its first Set.
+// TestWriteFailuresBeforeAnythingWasSentAreNotUnconfirmed counts on Send's order: a status read,
+// then the request's own G2 and G3, then the G2 just before its first Set.
 func TestWriteFailuresBeforeAnythingWasSentAreNotUnconfirmed(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -212,17 +213,17 @@ func TestWriteFailuresBeforeAnythingWasSentAreNotUnconfirmed(t *testing.T) {
 	}{
 		{
 			"status read fails before the write",
-			func(c *sim.Config) { c.GetFailAt = 2; c.FailMessage = "boom" },
-			nil, "boom",
-		},
-		{
-			"report 3 read fails before the write",
 			func(c *sim.Config) { c.GetFailAt = 3; c.FailMessage = "boom" },
 			nil, "boom",
 		},
 		{
+			"report 3 read fails before the write",
+			func(c *sim.Config) { c.GetFailAt = 4; c.FailMessage = "boom" },
+			nil, "boom",
+		},
+		{
 			"generation already moved",
-			func(c *sim.Config) { c.GenerationChangeAtGet = 2 },
+			func(c *sim.Config) { c.GenerationChangeAtGet = 3 },
 			func(t *testing.T, err error) {
 				if !errors.Is(err, ErrGenerationChanged) {
 					t.Error("not ErrGenerationChanged")
@@ -231,7 +232,7 @@ func TestWriteFailuresBeforeAnythingWasSentAreNotUnconfirmed(t *testing.T) {
 		},
 		{
 			"generation moved just before the first Set",
-			func(c *sim.Config) { c.GenerationChangeAtGet = 4 },
+			func(c *sim.Config) { c.GenerationChangeAtGet = 5 },
 			func(t *testing.T, err error) {
 				if !errors.Is(err, ErrGenerationChanged) {
 					t.Error("not ErrGenerationChanged")
@@ -298,5 +299,55 @@ func TestPreconditionSentinels(t *testing.T) {
 		ErrNotReady.Error() != "AirPods settings connection is not ready" ||
 		ErrMicrophoneActive.Error() != "Stop microphone use before changing AirPods settings" {
 		t.Error("sentinel text changed")
+	}
+}
+
+func TestPreconditionsAreReadAgainForEachWrite(t *testing.T) {
+	writes := map[string]func(*SettingsClient) (string, error){
+		"Set":  func(s *SettingsClient) (string, error) { return s.Set("mode", 1) },
+		"Send": func(s *SettingsClient) (string, error) { return s.Send("mode", 1) },
+	}
+	for name, write := range writes {
+		t.Run(name, func(t *testing.T) {
+			// A microphone that starts after the client was created refuses the write.
+			settings, device := settingsFor(t, sim.Default())
+			device.SetFlags(0x13)
+			if _, err := write(settings); !errors.Is(err, ErrMicrophoneActive) {
+				t.Errorf("started microphone: %v", err)
+			}
+			device.SetFlags(0x01)
+			if _, err := write(settings); !errors.Is(err, ErrNotReady) {
+				t.Errorf("not ready any more: %v", err)
+			}
+			if device.Writes() != 0 {
+				t.Error("wrote anyway")
+			}
+			// And one that stopped lets it through on the same client.
+			device.SetFlags(0x03)
+			if _, err := write(settings); err != nil {
+				t.Errorf("back to ready: %v", err)
+			}
+
+			cfg := sim.Default()
+			cfg.Flags = 0x01
+			waiting, device := settingsFor(t, cfg)
+			if _, err := write(waiting); !errors.Is(err, ErrNotReady) {
+				t.Errorf("not ready yet: %v", err)
+			}
+			device.SetFlags(0x03)
+			if _, err := write(waiting); err != nil {
+				t.Errorf("a settings connection that came up: %v", err)
+			}
+
+			// The generation alone stays pinned.
+			pinned, device := settingsFor(t, sim.Default())
+			device.BumpGeneration()
+			if _, err := write(pinned); !errors.Is(err, ErrGenerationChanged) {
+				t.Errorf("new generation: %v", err)
+			}
+			if device.Writes() != 0 {
+				t.Error("wrote across a generation")
+			}
+		})
 	}
 }
