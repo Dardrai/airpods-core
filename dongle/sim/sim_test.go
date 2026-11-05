@@ -140,3 +140,87 @@ func TestVirtualClock(t *testing.T) {
 		t.Fatal("clock did not advance")
 	}
 }
+
+func typedReport(op byte, generation uint32, sequence uint32, total, offset uint16, size byte) [hid.ReportSize]byte {
+	var data [hid.ReportSize]byte
+	header := hid.Header(3)
+	copy(data[:], header[:])
+	data[7] = op
+	le := binary.LittleEndian
+	le.PutUint32(data[8:], generation)
+	le.PutUint32(data[12:], sequence)
+	le.PutUint16(data[16:], total)
+	le.PutUint16(data[18:], offset)
+	data[20] = size
+	return data
+}
+
+// TestBadReportsAnswerWithAFailurePhase sends what no client should, which used to panic.
+func TestBadReportsAnswerWithAFailurePhase(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		op   byte
+		off  uint16
+		size byte
+	}{
+		{"fragment above the limit", 7, 0, 43},
+		{"fragment past the report", 7, 0, 255},
+		{"page past the response", 4, 9, 0},
+		{"page far past the response", 4, 0xffff, 0},
+		{"stage at a wrong offset", 7, 5, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			device := New(Default())
+			if err := device.Set(typedReport(tc.op, 7, 1, 1, tc.off, tc.size)); err != nil {
+				t.Fatal(err)
+			}
+			reply, err := device.Get(3)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if reply[21] != 4 || reply[22] != 1 {
+				t.Errorf("phase %d code %d", reply[21], reply[22])
+			}
+		})
+	}
+}
+
+// TestArbitraryReportsNeverPanic walks every op, size and a spread of offsets, on a device
+// that has a response ready to page through.
+func TestArbitraryReportsNeverPanic(t *testing.T) {
+	device := New(Default())
+	for op := 0; op < 256; op++ {
+		for size := 0; size < 256; size += 5 {
+			for _, offset := range []uint16{0, 1, 42, 43, 512, 4096, 0xffff} {
+				if err := device.Set(typedReport(byte(op), 7, 1, uint16(size), offset, byte(size))); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := device.Get(3); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+}
+
+func TestCancelDropsACommitInProgress(t *testing.T) {
+	cfg := Default()
+	cfg.CommitDelay = 3
+	device := New(cfg)
+	stage := typedReport(7, 7, 1, 1, 0, 1)
+	stage[22] = 2
+	for _, report := range [][hid.ReportSize]byte{stage, typedReport(6, 7, 1, 0, 0, 0), typedReport(5, 7, 1, 0, 0, 0)} {
+		if err := device.Set(report); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for read := 0; read < 5; read++ {
+		reply, err := device.Get(3)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if reply[21] != 4 || reply[22] != 8 {
+			t.Fatalf("read %d: phase %d code %d", read, reply[21], reply[22])
+		}
+	}
+}

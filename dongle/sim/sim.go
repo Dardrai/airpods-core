@@ -55,6 +55,9 @@ const (
 	TamperHugeTotal     = "huge-total"     // total above 4096
 )
 
+// maxFragment is the most a report 3 fragment can carry.
+const maxFragment = 42
+
 // Config is the simulated device's state and faults; the zero value of a fault disables it.
 type Config struct {
 	Serial    string `json:"serial"`
@@ -493,6 +496,10 @@ func (d *Device) typed(data [hid.ReportSize]byte) {
 	case 1, 2, 3, 7:
 		size := int(data[20])
 		offset := int(le.Uint16(data[18:]))
+		if size > maxFragment {
+			d.fail(data, 1)
+			return
+		}
 		if offset == 0 {
 			d.staged = nil
 		}
@@ -516,6 +523,8 @@ func (d *Device) typed(data [hid.ReportSize]byte) {
 		offset := int(le.Uint16(data[18:]))
 		d.page(data, offset)
 	case 5:
+		// A commit still in phase 2 is dropped with the request, not finished later.
+		d.phase2Reads, d.pendingReply = 0, nil
 		d.fail(data, 8)
 	}
 	if d.cfg.ForeignSequence {
@@ -576,12 +585,15 @@ func (d *Device) commit(request [hid.ReportSize]byte) {
 func (d *Device) page(request [hid.ReportSize]byte, offset int) {
 	le := binary.LittleEndian
 	size := d.cfg.PageSize
-	if size == 0 {
-		size = 42
+	if size <= 0 {
+		size = maxFragment
 	}
 	total := len(d.response)
-	remaining := max(total-offset, 0)
-	count := min(size, remaining)
+	if offset > total {
+		d.fail(request, 1)
+		return
+	}
+	count := min(size, total-offset)
 	d.reply = request
 	clear(d.reply[16:])
 	le.PutUint16(d.reply[16:], uint16(total))
