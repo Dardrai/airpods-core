@@ -323,6 +323,79 @@ func TestFailedRequestsAreCancelled(t *testing.T) {
 	}
 }
 
+// A reconnect in the middle of a request must not leave it staged under the old generation.
+func TestAReconnectMidRequestIsCancelled(t *testing.T) {
+	// Traffic as in TestTypedRequestGenerationChanges, then the wait for the stalled commit.
+	for at := 4; at <= 9; at++ {
+		for _, kind := range []string{"client", "session"} {
+			cfg := sim.Default()
+			cfg.GenerationChangeAtGet = at
+			cfg.StallCommit = true
+			device := &recordingDevice{Device: sim.New(cfg)}
+			client := NewClient(device)
+			client.SetClock(sim.NewVirtualClock())
+			var err error
+			if kind == "session" {
+				// OpenSession reads the status first, so the same traffic is one Get later.
+				device.Update(func(c *sim.Config) { c.GenerationChangeAtGet++ })
+				session, openErr := client.OpenSession()
+				if openErr != nil {
+					t.Fatal(openErr)
+				}
+				_, err = session.Feature([]byte{9})
+				session.Close()
+			} else {
+				_, err = client.TypedRequest([]byte{9}, nil)
+			}
+			if !errors.Is(err, ErrGenerationChanged) || errors.Is(err, ErrNotSent) {
+				t.Errorf("change at get %d, %s: %v", at, kind, err)
+			}
+			if device.ops[opCancel] != 1 {
+				t.Errorf("change at get %d, %s: sent %d cancels", at, kind, device.ops[opCancel])
+			}
+			device.Update(func(c *sim.Config) { c.StallCommit = false })
+			for range 2 {
+				if _, err := client.TypedRequest([]byte{9}, nil); err != nil {
+					t.Errorf("change at get %d, %s: the channel was left busy: %v", at, kind, err)
+				}
+			}
+			if device.ops[opCancel] != 1 {
+				t.Errorf("change at get %d, %s: later requests sent cancels", at, kind)
+			}
+		}
+	}
+}
+
+// What an earlier generation left staged is stale, not a competing app.
+func TestAStaleStagedRequestIsCancelledAndAForeignOneIsBusy(t *testing.T) {
+	for _, phase := range []byte{phaseStaged, phaseProcessing} {
+		cfg := sim.Default()
+		cfg.InitialPhase = phase
+		cfg.InitialSequence = 41
+		device := &recorder{Device: sim.New(cfg)}
+		client := NewClient(device)
+		client.SetClock(sim.NewVirtualClock())
+		if _, err := client.TypedRequest([]byte{9}, nil); !rejected(2)(err) || !errors.Is(err, ErrNotSent) {
+			t.Fatalf("phase %d, same generation: %v", phase, err)
+		}
+		if len(device.sent) != 0 {
+			t.Fatalf("phase %d: sent %d reports to a busy channel", phase, len(device.sent))
+		}
+		device.BumpGeneration()
+		if _, err := client.TypedRequest([]byte{9}, nil); err != nil {
+			t.Fatalf("phase %d, earlier generation: %v", phase, err)
+		}
+		le := binary.LittleEndian
+		cancel := device.sent[0]
+		if cancel[7] != opCancel || le.Uint32(cancel[8:]) != cfg.Generation || le.Uint32(cancel[12:]) != 41 {
+			t.Errorf("phase %d: cancel = % x", phase, cancel[:24])
+		}
+		if stage := device.sent[1]; le.Uint32(stage[8:]) != cfg.Generation+1 || le.Uint32(stage[12:]) != 42 {
+			t.Errorf("phase %d: request = % x", phase, stage[:24])
+		}
+	}
+}
+
 func TestRejectedAndUnsentRequestsAreNotCancelled(t *testing.T) {
 	const cancelOp = 5
 	for _, tc := range []struct {

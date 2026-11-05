@@ -11,10 +11,9 @@ const (
 	opSendAACP = 2 // AAP packet with no response of its own
 	opCancel   = 5
 
-	maxPayload    = 512
-	cancelWait    = time.Second
-	pageWait      = time.Second
-	codeCancelled = 8
+	maxPayload = 512
+	cancelWait = time.Second
+	pageWait   = time.Second
 )
 
 // Session is one run of related requests. Raw traffic to the AirPods needs the settings

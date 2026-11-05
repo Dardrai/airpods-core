@@ -243,11 +243,6 @@ func (t *transaction) send(op byte, total, offset int, data []byte) error {
 	if err := t.ctx.Err(); err != nil {
 		return err
 	}
-	return t.sendNow(op, total, offset, data)
-}
-
-// sendNow is send without regard to the context, for the cancel that follows it ending.
-func (t *transaction) sendNow(op byte, total, offset int, data []byte) error {
 	if err := t.checkGeneration(t.rules.changedText); err != nil {
 		return err
 	}
@@ -304,7 +299,8 @@ func (t *transaction) wait(limit time.Duration, accept func(report [hid.ReportSi
 	return none, ErrRPCTimeout
 }
 
-// run performs one request. A channel another client is using is a RequestRejected with code 2.
+// run performs one request. A channel another client is using is a RequestRejected with code 2;
+// a request left on it by an earlier generation is cancelled first.
 // A failure from before the first Set matches ErrNotSent.
 func (t *transaction) run(op byte, payload []byte) ([]byte, error) {
 	if len(payload) == 0 || len(payload) > t.rules.maxPayload {
@@ -330,7 +326,20 @@ func (t *transaction) run(op byte, payload []byte) ([]byte, error) {
 		return nil, NotSent(err)
 	}
 	if initial[21] == phaseStaged || initial[21] == phaseProcessing {
-		return nil, NotSent(&RequestRejected{2})
+		le := binary.LittleEndian
+		if le.Uint32(initial[8:]) == current {
+			return nil, NotSent(&RequestRejected{2})
+		}
+		// A request of an earlier generation is nobody's any more: a reconnect cut it off.
+		t.generation, t.sequence = le.Uint32(initial[8:]), le.Uint32(initial[12:])
+		dropped := t.drop()
+		t.generation = current
+		if !dropped {
+			return nil, NotSent(&RequestRejected{2})
+		}
+		if initial, err = t.dev.Get(3); err != nil {
+			return nil, NotSent(err)
+		}
 	}
 	t.sequence = binary.LittleEndian.Uint32(initial[12:]) + 1
 	if t.sequence == 0 {
@@ -410,27 +419,36 @@ func (t *transaction) exchange(op byte, payload []byte) ([]byte, error) {
 	return output, nil
 }
 
-// cancel asks the dongle to drop the request and waits for its receipt, since later traffic
-// must not overtake it. A request that never reached a Set has nothing to drop. It runs whatever
-// the context says, within cancelWait, so a stopped request does not leave the channel busy.
+// cancel asks the dongle to drop the request, since later traffic must not overtake it. A
+// request that never reached a Set has nothing to drop. It runs whatever the context says and
+// whatever the generation has become, so a stopped request does not leave the channel busy.
 func (t *transaction) cancel() {
 	if !t.attempted {
 		t.active = false
 	}
-	if !t.active || t.sendNow(opCancel, 0, 0, nil) != nil {
-		return
+	if t.active && t.drop() {
+		t.active = false
+	}
+}
+
+// drop cancels the request of t.generation and t.sequence and waits, within cancelWait, for the
+// dongle to end it. The cancel goes out without a look at the current generation: the dongle
+// answers one from an earlier generation with a failure too, and that is what frees the channel.
+func (t *transaction) drop() bool {
+	if t.dev.Set(t.report(opCancel, 0, 0, nil)) != nil {
+		return false
 	}
 	le := binary.LittleEndian
 	deadline := t.clock.Now().Add(cancelWait)
 	for t.clock.Now().Before(deadline) {
 		report, err := t.dev.Get(3)
 		if err != nil || le.Uint32(report[8:]) != t.generation {
-			return
+			return false
 		}
-		if le.Uint32(report[12:]) == t.sequence && report[21] == phaseFailed && report[22] == codeCancelled {
-			t.active = false
-			return
+		if le.Uint32(report[12:]) == t.sequence && report[21] == phaseFailed {
+			return true
 		}
 		t.clock.Sleep(rpcPoll)
 	}
+	return false
 }
