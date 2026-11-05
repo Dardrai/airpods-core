@@ -95,10 +95,10 @@ func TestListInterfaces(t *testing.T) {
 			closed: 1,
 		},
 		{
-			name:   "no serial is not openable",
+			name:   "no serial stays openable, as Open needs it only to filter",
 			paths:  []string{control},
 			nodes:  map[string]any{control: fakeQuery{vid: VendorID, pid: ProductControl, vendor: true, serialErr: boom}},
-			want:   []Info{{Path: control, PID: ProductControl, Err: boom}},
+			want:   []Info{{Path: control, PID: ProductControl, Openable: true}},
 			closed: 1,
 		},
 	} {
@@ -120,6 +120,153 @@ func TestListInterfaces(t *testing.T) {
 			}
 			if closed != tc.closed {
 				t.Errorf("closed %d, want %d", closed, tc.closed)
+			}
+		})
+	}
+}
+
+func TestSelectInterface(t *testing.T) {
+	const (
+		audio   = `\\?\hid#vid_cafe&pid_4015&mi_03#7&1&0#{guid}`
+		mouse   = `\\?\hid#vid_cafe&pid_4015&mi_01#7&5&0#{guid}`
+		control = `\\?\HID#VID_CAFE&PID_4005#7&2&0#{guid}`
+		other   = `\\?\hid#vid_046d&pid_c52b#7&3&0#{guid}`
+		noMatch = "no match"
+	)
+	dongle := func(serial string) fakeQuery {
+		return fakeQuery{vid: VendorID, pid: ProductAudio, vendor: true, serialNo: serial}
+	}
+	first, second := errors.New("first"), errors.New("second")
+	for _, tc := range []struct {
+		name    string
+		paths   []string
+		serial  string
+		nodes   map[string]any // fakeQuery or the error from query
+		openErr map[string]error
+		want    string // chosen path; empty on failure
+		err     error  // the failure's identity; nil means the MatchError below
+		found   int
+		opened  []string // handles closed again by exactlyOne
+	}{
+		{name: "no interfaces", found: 0},
+		{name: "other products are never queried", paths: []string{other}, found: 0},
+		{
+			name:  "one bad interface does not hide the good one",
+			paths: []string{mouse, audio},
+			nodes: map[string]any{mouse: first, audio: dongle("S1")},
+			want:  audio,
+		},
+		{
+			name:    "an interface that refuses the full open is skipped",
+			paths:   []string{mouse, audio},
+			nodes:   map[string]any{mouse: dongle("S0"), audio: dongle("S1")},
+			openErr: map[string]error{mouse: first},
+			want:    audio,
+		},
+		{
+			name:  "another collection is not even opened",
+			paths: []string{mouse, audio},
+			nodes: map[string]any{mouse: fakeQuery{vid: VendorID, pid: ProductAudio}, audio: dongle("S1")},
+			want:  audio,
+		},
+		{
+			name:  "unanswered questions rule out only that interface",
+			paths: []string{mouse, control, audio},
+			nodes: map[string]any{
+				mouse:   fakeQuery{noAttr: true},
+				control: fakeQuery{vid: VendorID, pid: ProductControl, vendorErr: first},
+				audio:   dongle("S1"),
+			},
+			want: audio,
+		},
+		{
+			name:  "the serial is optional without a filter",
+			paths: []string{audio},
+			nodes: map[string]any{audio: fakeQuery{vid: VendorID, pid: ProductAudio, vendor: true, serialErr: first}},
+			want:  audio,
+		},
+		{
+			name:   "the serial is required with a filter",
+			paths:  []string{audio},
+			serial: "S1",
+			nodes:  map[string]any{audio: fakeQuery{vid: VendorID, pid: ProductAudio, vendor: true, serialErr: first}},
+			err:    first,
+		},
+		{
+			name:   "the filter picks one",
+			paths:  []string{mouse, audio},
+			serial: "S1",
+			nodes:  map[string]any{mouse: dongle("S0"), audio: dongle("S1")},
+			want:   audio,
+		},
+		{
+			name:   "a filter that matches nothing is no match",
+			paths:  []string{audio},
+			serial: "S9",
+			nodes:  map[string]any{audio: dongle("S1")},
+			found:  0,
+		},
+		{
+			name:  "with no match the first failure is the answer",
+			paths: []string{mouse, audio},
+			nodes: map[string]any{mouse: first, audio: second},
+			err:   first,
+		},
+		{
+			name:    "a failed open is remembered too",
+			paths:   []string{audio},
+			nodes:   map[string]any{audio: dongle("S1")},
+			openErr: map[string]error{audio: first},
+			err:     first,
+		},
+		{
+			name:   "two matches close both",
+			paths:  []string{audio, control},
+			nodes:  map[string]any{audio: dongle("S1"), control: fakeQuery{vid: VendorID, pid: ProductControl, vendor: true, serialNo: "S2"}},
+			found:  2,
+			opened: []string{audio, control},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			queryClosed, queried := 0, 0
+			var closed []string
+			got, err := selectInterface(tc.paths, tc.serial, func(path string) (queryNode, error) {
+				switch v := tc.nodes[path].(type) {
+				case error:
+					return nil, v
+				case fakeQuery:
+					queried++
+					v.closed = &queryClosed
+					return v, nil
+				}
+				t.Fatalf("queried %s", path)
+				return nil, nil
+			}, func(info Info) (string, error) {
+				if err := tc.openErr[info.Path]; err != nil {
+					return "", err
+				}
+				return info.Path, nil
+			}, func(path string) { closed = append(closed, path) }, noMatch)
+			switch {
+			case tc.want != "":
+				if err != nil || got != tc.want {
+					t.Fatalf("got %q, err %v", got, err)
+				}
+			case tc.err != nil:
+				if !errors.Is(err, tc.err) {
+					t.Fatalf("err %v, want %v", err, tc.err)
+				}
+			default:
+				var mismatch *MatchError
+				if !errors.As(err, &mismatch) || mismatch.Found != tc.found || err.Error() != noMatch {
+					t.Fatalf("err %v", err)
+				}
+			}
+			if queryClosed != queried {
+				t.Errorf("%d query handles left open", queried-queryClosed)
+			}
+			if !reflect.DeepEqual(closed, tc.opened) {
+				t.Errorf("closed %v, want %v", closed, tc.opened)
 			}
 		})
 	}

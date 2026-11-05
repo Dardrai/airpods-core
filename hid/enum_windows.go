@@ -5,7 +5,6 @@ package hid
 import (
 	"errors"
 	"fmt"
-	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -32,8 +31,12 @@ const (
 	errorNoMoreItems      = windows.Errno(259)
 	hidpStatusSuccess     = 0x110000
 	usagePageVendor       = 0xff31
-	maxInterfaces         = 256
+	// maxInterfaces only guards against an enumeration that never ends. Reaching it is
+	// an error, because a search that stopped early could miss the dongle.
+	maxInterfaces = 4096
 )
+
+var errTooManyInterfaces = fmt.Errorf("Stopped after %d HID interfaces without reaching the end of the list", maxInterfaces)
 
 type deviceInterfaceData struct {
 	size     uint32
@@ -73,28 +76,22 @@ func winError(err error) error {
 
 // Open finds exactly one vendor HID collection of the dongle, optionally by serial.
 func Open(serial string) (Device, error) {
-	var found []*device
-	err := walkInterfaces(func(path string) error {
-		if !pathMatches(path) {
-			return nil
-		}
-		d, err := probe(path, serial)
-		if err != nil {
-			return err
-		}
-		if d != nil {
-			found = append(found, d)
-		}
-		return nil
-	})
+	paths, skipped, err := interfacePaths()
 	if err != nil {
-		for _, d := range found {
-			d.Close()
-		}
 		return nil, err
 	}
-	d, err := exactlyOne(found, func(d *device) { d.Close() }, "Expected exactly one matching Pico vendor HID collection")
+	d, err := selectInterface(paths, serial, openQuery, func(info Info) (*device, error) {
+		handle, err := openHandle(info.Path)
+		if err != nil {
+			return nil, err
+		}
+		return &device{handle: handle, serial: info.Serial}, nil
+	}, func(d *device) { d.Close() }, "Expected exactly one matching Pico vendor HID collection")
 	if err != nil {
+		var mismatch *MatchError
+		if errors.As(err, &mismatch) && mismatch.Found == 0 && skipped != nil {
+			return nil, skipped
+		}
 		return nil, err
 	}
 	return d, nil
@@ -103,24 +100,22 @@ func Open(serial string) (Device, error) {
 // Enumerate lists every attached dongle without keeping any of them open. No dongle is
 // an empty list, not an error.
 func Enumerate() ([]Info, error) {
-	var paths []string
-	err := walkInterfaces(func(path string) error {
-		paths = append(paths, path)
-		return nil
-	})
+	paths, _, err := interfacePaths()
 	if err != nil {
 		return nil, err
 	}
 	return listInterfaces(paths, openQuery, openFull), nil
 }
 
-// walkInterfaces visits the path of every present HID interface until visit fails.
-func walkInterfaces(visit func(path string) error) error {
+// interfacePaths lists the path of every present HID interface. An interface whose path cannot
+// be read is left out, with the first such failure returned in skipped; err means the list
+// as a whole could not be had.
+func interfacePaths() (paths []string, skipped, err error) {
 	var guid windows.GUID
 	procHidDGetHidGuid.Call(uintptr(unsafe.Pointer(&guid)))
 	info, _, callErr := procSetupDiGetClassDevsW.Call(uintptr(unsafe.Pointer(&guid)), 0, 0, digcfPresentInterface)
 	if info == uintptr(windows.InvalidHandle) {
-		return winError(callErr)
+		return nil, nil, winError(callErr)
 	}
 	defer procSetupDiDestroyInfoList.Call(info)
 
@@ -130,19 +125,20 @@ func walkInterfaces(visit func(path string) error) error {
 		ok, _, callErr := procSetupDiEnumInterfaces.Call(info, 0, uintptr(unsafe.Pointer(&guid)), index, uintptr(unsafe.Pointer(&iface)))
 		if ok == 0 {
 			if errors.Is(callErr, errorNoMoreItems) {
-				return nil
+				return paths, skipped, nil
 			}
-			return winError(callErr)
+			return nil, nil, winError(callErr)
 		}
 		path, err := interfacePath(info, &iface)
 		if err != nil {
-			return err
+			if skipped == nil {
+				skipped = err
+			}
+			continue
 		}
-		if err := visit(path); err != nil {
-			return err
-		}
+		paths = append(paths, path)
 	}
-	return nil
+	return nil, nil, errTooManyInterfaces
 }
 
 // queryHandle is a handle without access rights, which is enough for asking about a
@@ -181,25 +177,28 @@ func (h queryHandle) serial() (string, error) {
 
 func (h queryHandle) close() { windows.CloseHandle(windows.Handle(h)) }
 
-// openFull tries the access Open asks for and lets go again.
-func openFull(path string) error {
+// openHandle opens an interface with the access reports need.
+func openHandle(path string) (windows.Handle, error) {
 	name, err := windows.UTF16PtrFromString(path)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	handle, err := windows.CreateFile(name, windows.GENERIC_READ|windows.GENERIC_WRITE,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OVERLAPPED, 0)
 	if err != nil {
-		return winError(err)
+		return 0, winError(err)
+	}
+	return handle, nil
+}
+
+// openFull tries the access Open asks for and lets go again.
+func openFull(path string) error {
+	handle, err := openHandle(path)
+	if err != nil {
+		return err
 	}
 	windows.CloseHandle(handle)
 	return nil
-}
-
-func pathMatches(path string) bool {
-	lower := strings.ToLower(path)
-	return strings.Contains(lower, fmt.Sprintf("vid_cafe&pid_%04x", ProductAudio)) ||
-		strings.Contains(lower, fmt.Sprintf("vid_cafe&pid_%04x", ProductControl))
 }
 
 // interfacePath reads the variable-size detail record: cbSize DWORD, then the UTF-16 path.
@@ -222,46 +221,6 @@ func interfacePath(info uintptr, iface *deviceInterfaceData) (string, error) {
 		return "", winError(callErr)
 	}
 	return windows.UTF16PtrToString((*uint16)(unsafe.Add(detail, 4))), nil
-}
-
-// probe returns the opened device, or nil when this interface is not the one sought.
-func probe(path, serial string) (*device, error) {
-	name, err := windows.UTF16PtrFromString(path)
-	if err != nil {
-		return nil, err
-	}
-	handle, err := windows.CreateFile(name, windows.GENERIC_READ|windows.GENERIC_WRITE,
-		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, windows.FILE_FLAG_OVERLAPPED, 0)
-	if err != nil {
-		return nil, winError(err)
-	}
-	keep := false
-	defer func() {
-		if !keep {
-			windows.CloseHandle(handle)
-		}
-	}()
-	attr := hiddAttributes{}
-	attr.size = uint32(unsafe.Sizeof(attr))
-	ok, _, _ := procHidDGetAttributes.Call(uintptr(handle), uintptr(unsafe.Pointer(&attr)))
-	if ok == 0 || !isProduct(attr.vid, attr.pid) {
-		return nil, nil
-	}
-	match, err := capsMatch(handle)
-	if err != nil || !match {
-		return nil, err
-	}
-	var value [256]uint16
-	ok, _, callErr := procHidDGetSerialNumberString.Call(uintptr(handle), uintptr(unsafe.Pointer(&value[0])), unsafe.Sizeof(value))
-	if ok == 0 {
-		return nil, winError(callErr)
-	}
-	found := windows.UTF16ToString(value[:])
-	if serial != "" && found != serial {
-		return nil, nil
-	}
-	keep = true
-	return &device{handle: handle, serial: found}, nil
 }
 
 // capsMatch checks HIDP_CAPS: usage@0 = 1, usage page@2 = 0xff31, feature length@8 = 64.
