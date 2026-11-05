@@ -7,6 +7,7 @@ import (
 
 	"github.com/Dardrai/airpods-core/dongle"
 	"github.com/Dardrai/airpods-core/dongle/sim"
+	"github.com/Dardrai/airpods-core/hid"
 )
 
 const leaseKind = 10
@@ -254,5 +255,170 @@ func TestApplyAbsentSaysWhatMayBeLeftOn(t *testing.T) {
 	_, done, err = apply.Absent(errors.New("no dongle"))
 	if !done || err == nil || strings.Contains(err.Error(), "may still be active") || modes.Recovery() != nil {
 		t.Fatalf("done %v, err %v, recovery %+v", done, err, modes.Recovery())
+	}
+}
+
+// firstPacketDevice runs a hook on each commit, counted from one, and records how many
+// commits came before the first AAP packet.
+type firstPacketDevice struct {
+	*sim.Device
+	onCommit func(n int)
+	commits  int
+	firstAAP int
+}
+
+func (d *firstPacketDevice) Set(data [hid.ReportSize]byte) error {
+	const opCommit, opSendAACP = 6, 2
+	if data[0] == 3 && data[7] == opSendAACP && d.firstAAP == 0 {
+		d.firstAAP = d.commits
+	}
+	if data[0] == 3 && data[7] == opCommit {
+		d.commits++
+		if d.onCommit != nil {
+			d.onCommit(d.commits)
+		}
+	}
+	return d.Device.Set(data)
+}
+
+// A failure at the first packet, before it went out, changed nothing: it must not be reported
+// as an unknown state or leave a recovery to offer.
+func TestFailureBeforeTheFirstPacketIsNotUnconfirmed(t *testing.T) {
+	dry := &firstPacketDevice{Device: sim.New(proThree().Config())}
+	client := dongle.NewClient(dry)
+	client.SetClock(sim.NewVirtualClock())
+	if _, err := new(Modes).StartSet(client, HearingAid, true); err != nil {
+		t.Fatal(err)
+	}
+	// The last commit before the packet renews the lease, after the last state check. The one
+	// before that is the last read, so anything changed there is seen just before the packet.
+	lastRead := dry.firstAAP - 1
+
+	for _, tc := range []struct {
+		name   string
+		at     int
+		change func(*sim.Device)
+		undo   func(*sim.Device)
+		check  func(*testing.T, error)
+	}{
+		{
+			name:   "a refusal",
+			at:     lastRead,
+			change: func(d *sim.Device) { d.SetFlags(0x13) },
+			undo:   func(d *sim.Device) { d.SetFlags(0x03) },
+			check: func(t *testing.T, err error) {
+				refused(t, err, "Stop recording")
+				if !errors.Is(err, dongle.ErrMicrophoneActive) {
+					t.Error("not ErrMicrophoneActive")
+				}
+			},
+		},
+		{
+			name:   "a lost lease",
+			at:     lastRead,
+			change: func(d *sim.Device) { d.Update(func(c *sim.Config) { c.Fail = map[byte]byte{leaseKind: 3} }) },
+			undo:   func(d *sim.Device) { d.Update(func(c *sim.Config) { c.Fail = nil }) },
+			check: func(t *testing.T, err error) {
+				var rejected *dongle.RequestRejected
+				if !errors.As(err, &rejected) || rejected.Code != 3 {
+					t.Errorf("err %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := proThree()
+			var device *firstPacketDevice
+			device = &firstPacketDevice{Device: sim.New(a.Config()), onCommit: func(n int) {
+				if n == tc.at {
+					tc.change(device.Device)
+				}
+			}}
+			client := dongle.NewClient(device)
+			client.SetClock(sim.NewVirtualClock())
+			modes := new(Modes)
+			change, err := modes.StartSet(client, HearingAid, true)
+			if change != nil || err == nil {
+				t.Fatalf("change %v, err %v", change, err)
+			}
+			tc.check(t, err)
+			var unconfirmed *ModeUnconfirmed
+			if errors.As(err, &unconfirmed) {
+				t.Errorf("reported as unconfirmed: %v", err)
+			}
+			if !errors.Is(err, dongle.ErrNotSent) {
+				t.Errorf("not ErrNotSent: %v", err)
+			}
+			if strings.Contains(err.Error(), "unknown") {
+				t.Errorf("text claims an unknown state: %v", err)
+			}
+			if len(a.Received) != 0 {
+				t.Errorf("sent %x", a.Received)
+			}
+			if modes.Recovery() != nil {
+				t.Error("a recovery was offered for a change that never went out")
+			}
+			device.onCommit = nil
+			tc.undo(device.Device)
+			next, err := modes.StartSet(client, HearingAid, true)
+			if err != nil {
+				t.Fatalf("the next try: %v", err)
+			}
+			if result, err := next.wait(client); err != nil || result.State.HearingEnabled != FlagOn {
+				t.Fatalf("the next try: %+v %v", result, err)
+			}
+		})
+	}
+}
+
+func TestLaterPacketFailureStaysUnconfirmed(t *testing.T) {
+	var device *firstPacketDevice
+	a := proThree()
+	device = &firstPacketDevice{Device: sim.New(a.Config())}
+	device.onCommit = func(int) {
+		if len(a.Received) == 1 {
+			device.Update(func(c *sim.Config) { c.Fail = map[byte]byte{leaseKind: 3} })
+		}
+	}
+	client := dongle.NewClient(device)
+	client.SetClock(sim.NewVirtualClock())
+	modes := new(Modes)
+	_, err := modes.StartSet(client, HearingAid, true)
+	var unconfirmed *ModeUnconfirmed
+	if !errors.As(err, &unconfirmed) || unconfirmed.Recovery == nil {
+		t.Fatalf("err %#v", err)
+	}
+}
+
+func TestSentinelsMatchWithTheirTextUnchanged(t *testing.T) {
+	if ErrDeadline.Error() != "The dongle request ran out of time and was not retried." {
+		t.Errorf("text %q", ErrDeadline)
+	}
+	if !errors.Is(connectionChanged, dongle.ErrGenerationChanged) ||
+		connectionChanged.Error() != "The dongle connection changed. Read the settings again." {
+		t.Errorf("connection changed: %v", connectionChanged)
+	}
+	a := proThree()
+	client, dev := rig(t, a)
+	dev.SetFlags(0x13)
+	if _, err := new(Modes).StartSet(client, HearingAid, true); !errors.Is(err, dongle.ErrMicrophoneActive) {
+		t.Errorf("microphone: %v", err)
+	}
+	dev.SetFlags(0x00)
+	if _, err := new(Modes).StartSet(client, HearingAid, true); !errors.Is(err, dongle.ErrNotReady) {
+		t.Errorf("not ready: %v", err)
+	}
+}
+
+func TestOperationPastItsLimitIsErrDeadline(t *testing.T) {
+	client, _ := rig(t, proThree())
+	o, err := openOperation(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer o.close()
+	client.Clock().Sleep(operationLimit)
+	if err := o.check(); !errors.Is(err, ErrDeadline) {
+		t.Errorf("err %v", err)
 	}
 }

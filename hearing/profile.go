@@ -133,7 +133,7 @@ func writeSettings(exchange Exchanger, clock dongle.Clock, c Characteristic, bas
 	pdu := append([]byte{c.WriteOpcode, byte(c.Handle), byte(c.Handle >> 8)}, written...)
 	response, err := exchange(pdu)
 	if err != nil {
-		return Settings{}, unconfirmed("No reply to the hearing profile write. It may have applied; read the profile again.", err)
+		return Settings{}, unconfirmedWrite("No reply to the hearing profile write. It may have applied; read the profile again.", err)
 	}
 	if c.WriteOpcode == attWrite && !bytes.Equal(response, []byte{attWriteR}) {
 		return Settings{}, unconfirmed("The AirPods did not acknowledge the hearing profile write. Read the profile again.", errorText("Hearing profile write.", response))

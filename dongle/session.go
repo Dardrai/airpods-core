@@ -83,7 +83,7 @@ func (s *Session) do(op byte, payload []byte) ([]byte, error) {
 	s.client.mu.Lock()
 	defer s.client.mu.Unlock()
 	if err := s.ensureLease(op == opExchange || op == opSendAACP); err != nil {
-		return nil, err
+		return nil, NotSent(err) // Lease traffic only; this request has not gone out.
 	}
 	return s.request.run(op, payload)
 }
@@ -96,7 +96,8 @@ func (s *Session) AcquireLease() error {
 	return s.ensureLease(true)
 }
 
-// Exchange sends an ATT request to the AirPods and returns their response.
+// Exchange sends an ATT request to the AirPods and returns their response. A failure matching
+// ErrNotSent never went out, here and in the other requests of a session.
 func (s *Session) Exchange(pdu []byte) ([]byte, error) { return s.do(opExchange, pdu) }
 
 // SendAAP sends an AAP packet to the AirPods. It reports delivery, not its effect.

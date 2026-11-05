@@ -200,3 +200,103 @@ func TestSendChecksTheSameGatesAsSet(t *testing.T) {
 		t.Error("wrote anyway")
 	}
 }
+
+// TestWriteFailuresBeforeAnythingWasSentAreNotUnconfirmed counts on Send's order: the
+// request's own G2 and G3, then the G2 just before its first Set.
+func TestWriteFailuresBeforeAnythingWasSentAreNotUnconfirmed(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*sim.Config)
+		check  func(*testing.T, error)
+		text   string
+	}{
+		{
+			"status read fails before the write",
+			func(c *sim.Config) { c.GetFailAt = 2; c.FailMessage = "boom" },
+			nil, "boom",
+		},
+		{
+			"report 3 read fails before the write",
+			func(c *sim.Config) { c.GetFailAt = 3; c.FailMessage = "boom" },
+			nil, "boom",
+		},
+		{
+			"generation already moved",
+			func(c *sim.Config) { c.GenerationChangeAtGet = 2 },
+			func(t *testing.T, err error) {
+				if !errors.Is(err, ErrGenerationChanged) {
+					t.Error("not ErrGenerationChanged")
+				}
+			}, "Pico session changed; run the command again",
+		},
+		{
+			"generation moved just before the first Set",
+			func(c *sim.Config) { c.GenerationChangeAtGet = 4 },
+			func(t *testing.T, err error) {
+				if !errors.Is(err, ErrGenerationChanged) {
+					t.Error("not ErrGenerationChanged")
+				}
+			}, "Pico session changed during request",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := sim.Default()
+			tc.mutate(&cfg)
+			client, device := newClient(cfg)
+			settings, err := client.SettingsClient()
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = settings.Send("mode", 1)
+			if err == nil || err.Error() != tc.text {
+				t.Fatalf("err = %v, want %q", err, tc.text)
+			}
+			var unconfirmed *Unconfirmed
+			if errors.As(err, &unconfirmed) {
+				t.Errorf("wrapped as Unconfirmed: %v", err)
+			}
+			if !errors.Is(err, ErrNotSent) {
+				t.Errorf("not ErrNotSent: %v", err)
+			}
+			if device.Writes() != 0 {
+				t.Error("wrote anyway")
+			}
+			if tc.check != nil {
+				tc.check(t, err)
+			}
+		})
+	}
+}
+
+func TestAWriteThatWasAttemptedStaysUnconfirmed(t *testing.T) {
+	cfg := sim.Default()
+	cfg.SetFailOnWrite, cfg.FailMessage = true, "boom"
+	settings, _ := settingsFor(t, cfg)
+	_, err := settings.Set("mode", 1)
+	var unconfirmed *Unconfirmed
+	if !errors.As(err, &unconfirmed) {
+		t.Fatalf("err = %v", err)
+	}
+	if errors.Is(err, ErrNotSent) {
+		t.Error("the Set was tried, so it may have gone out")
+	}
+}
+
+func TestPreconditionSentinels(t *testing.T) {
+	for flags, want := range map[byte]error{1: ErrNotReady, 0x13: ErrMicrophoneActive} {
+		cfg := sim.Default()
+		cfg.Flags = flags
+		settings, _ := settingsFor(t, cfg)
+		if _, err := settings.Set("mode", 1); !errors.Is(err, want) {
+			t.Errorf("Set flags %#x: %v", flags, err)
+		}
+		if _, err := settings.Send("mode", 1); !errors.Is(err, want) {
+			t.Errorf("Send flags %#x: %v", flags, err)
+		}
+	}
+	if ErrGenerationChanged.Error() != "Pico session changed; run the command again" ||
+		ErrNotReady.Error() != "AirPods settings connection is not ready" ||
+		ErrMicrophoneActive.Error() != "Stop microphone use before changing AirPods settings" {
+		t.Error("sentinel text changed")
+	}
+}

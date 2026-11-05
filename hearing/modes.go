@@ -507,7 +507,8 @@ func (m *Modes) Recover(c *dongle.Client) (*ModeResult, error) {
 //
 // Packets go out once, here. Step then follows the outcome and never sends a packet. A
 // *ModeUnconfirmed, from here or from Step, means the state is unknown: offer StartRecover,
-// and do not call StartSet again on its own.
+// and do not call StartSet again on its own. A failure on the first packet that never went out
+// comes back as it is, since nothing changed.
 //
 // Gating: model.Profile.HearingAid is enforced here. Callers keep this behind the
 // experimental switch, since it changes how loud sound is presented and has not run on real
@@ -589,7 +590,10 @@ func (m *Modes) startChange(o *operation, mode Mode, on bool) (*ModeChange, erro
 		}
 	}
 	change := &ModeChange{modes: m, plan: plan, original: original, start: o.start, deadline: o.deadline}
-	if err := m.sendPlan(o, plan); err != nil {
+	if sent, err := m.sendPlan(o, plan); err != nil {
+		if !sent {
+			return nil, err // Nothing went out, so the state is what it was.
+		}
 		_, _, err = change.end(nil, err)
 		return nil, err
 	}
@@ -598,25 +602,33 @@ func (m *Modes) startChange(o *operation, mode Mode, on bool) (*ModeChange, erro
 	return change, nil
 }
 
-// sendPlan sends the plan once. Nothing here is ever repeated.
-func (m *Modes) sendPlan(o *operation, plan *ModePlan) error {
-	for _, packet := range plan.packets {
-		if slot, ok := slotOf(packet); ok {
-			i := slot - dongle.SlotHearingAid
-			m.fences[i], m.fenced[i] = m.revisions[i], true
+// sendPlan sends the plan once. Nothing here is ever repeated. sent reports whether anything
+// may have gone out; when it is false the error is the reason, unchanged.
+func (m *Modes) sendPlan(o *operation, plan *ModePlan) (sent bool, err error) {
+	for i, packet := range plan.packets {
+		slot, tracked := slotOf(packet)
+		if tracked {
+			index := slot - dongle.SlotHearingAid
+			m.fences[index], m.fenced[index] = m.revisions[index], true
 			m.cache.invalidate(slot)
 		}
 		if err := o.SendAAP(packet); err != nil {
-			return fmt.Errorf("The hearing mode change was interrupted, so its state is unknown: %w", err)
+			if i == 0 && errors.Is(err, dongle.ErrNotSent) {
+				if tracked {
+					m.fenced[slot-dongle.SlotHearingAid] = false // Nothing to wait for; the next read restores it.
+				}
+				return false, err
+			}
+			return true, fmt.Errorf("The hearing mode change was interrupted, so its state is unknown: %w", err)
 		}
 	}
 	if len(plan.packets) > 0 {
 		// This only asks for reports. It does not stand in for reading them.
 		if err := o.SendAAP(requestReports); err != nil {
-			return fmt.Errorf("The hearing mode change was sent, but its state is unknown: %w", err)
+			return true, fmt.Errorf("The hearing mode change was sent, but its state is unknown: %w", err)
 		}
 	}
-	return nil
+	return len(plan.packets) > 0, nil
 }
 
 // ModeChange follows one change that StartSet sent. Each Step is its own short device owner

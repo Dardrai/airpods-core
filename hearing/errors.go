@@ -1,6 +1,7 @@
 package hearing
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -8,10 +9,30 @@ import (
 )
 
 // Refused means a precondition failed and nothing was sent that could change the AirPods.
-// Reason is written to be shown to the user.
-type Refused struct{ Reason string }
+// Reason is written to be shown to the user. errors.Is finds the condition behind it, when it
+// is one of the dongle package's, such as dongle.ErrMicrophoneActive.
+type Refused struct {
+	Reason string
+	cause  error
+}
 
 func (r *Refused) Error() string { return r.Reason }
+func (r *Refused) Unwrap() error { return r.cause }
+
+// ErrDeadline means one request used up its time limit. Nothing further was sent for it.
+var ErrDeadline = errors.New("The dongle request ran out of time and was not retried.")
+
+// connectionChanged is dongle.ErrGenerationChanged as this package words it.
+var connectionChanged error = &reworded{"The dongle connection changed. Read the settings again.", dongle.ErrGenerationChanged}
+
+// reworded shows its own text and matches the condition it wraps.
+type reworded struct {
+	text string
+	err  error
+}
+
+func (e *reworded) Error() string { return e.text }
+func (e *reworded) Unwrap() error { return e.err }
 
 func refuse(format string, args ...any) error {
 	return &Refused{Reason: fmt.Sprintf(format, args...)}
@@ -31,6 +52,15 @@ func unconfirmed(message string, cause error) error {
 	return &dongle.Unconfirmed{Message: message, Err: cause}
 }
 
+// unconfirmedWrite is unconfirmed for the first request of a write, which may also have failed
+// before it went out. That failure stays as it is: the write cannot have applied.
+func unconfirmedWrite(message string, cause error) error {
+	if errors.Is(cause, dongle.ErrNotSent) {
+		return cause
+	}
+	return unconfirmed(message, cause)
+}
+
 const operationLimit = 60 * time.Second
 
 // operation is one user request: one session, one settings lease, one deadline. It
@@ -47,11 +77,11 @@ type operation struct {
 func requestGate(status dongle.Status) error {
 	switch {
 	case !status.Connected || !status.ControlsReady:
-		return refuse("Connect the dongle's AirPods before reading or changing hearing data.")
+		return &Refused{"Connect the dongle's AirPods before reading or changing hearing data.", dongle.ErrNotReady}
 	case !status.Has(dongle.CapRPC):
 		return refuse("Update the dongle firmware before reading or changing hearing data.")
 	case status.MicrophoneActive:
-		return refuse("Stop recording and wait for the microphone to recover before reading or changing hearing data.")
+		return &Refused{"Stop recording and wait for the microphone to recover before reading or changing hearing data.", dongle.ErrMicrophoneActive}
 	}
 	return nil
 }
@@ -97,14 +127,14 @@ func (o *operation) close() { o.session.Close() }
 
 func (o *operation) check() error {
 	if !o.clock.Now().Before(o.deadline) {
-		return fmt.Errorf("The dongle request ran out of time and was not retried.")
+		return ErrDeadline
 	}
 	status, err := o.client.Status()
 	if err != nil {
 		return err
 	}
 	if status.Generation != o.start.Generation || status.Peer != o.start.Peer {
-		return fmt.Errorf("The dongle connection changed. Read the settings again.")
+		return connectionChanged
 	}
 	return requestGate(status)
 }
@@ -112,7 +142,7 @@ func (o *operation) check() error {
 // Exchange implements Link.
 func (o *operation) Exchange(pdu []byte) ([]byte, error) {
 	if err := o.check(); err != nil {
-		return nil, err
+		return nil, dongle.NotSent(err)
 	}
 	response, err := o.session.Exchange(pdu)
 	if err != nil {
@@ -127,7 +157,7 @@ func (o *operation) Exchange(pdu []byte) ([]byte, error) {
 // SendAAP implements Link. A nil result reports delivery to the dongle, not an effect.
 func (o *operation) SendAAP(pdu []byte) error {
 	if err := o.check(); err != nil {
-		return err
+		return dongle.NotSent(err)
 	}
 	if err := o.session.SendAAP(pdu); err != nil {
 		return err

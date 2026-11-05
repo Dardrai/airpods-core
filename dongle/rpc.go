@@ -68,7 +68,8 @@ func (c *Client) Status() (Status, error) {
 }
 
 // TypedRequest runs one bounded report-3 request and never retries an uncertain
-// write. A non-nil generation pins the request to that connection generation.
+// write. A non-nil generation pins the request to that connection generation. A failure
+// matching ErrNotSent cannot have reached the dongle.
 func (c *Client) TypedRequest(payload []byte, generation *uint32) ([]byte, error) {
 	return c.typedRequest(opFeature, payload, generation)
 }
@@ -142,7 +143,7 @@ func (t *transaction) checkGeneration(message string) error {
 		return err
 	}
 	if current != t.generation {
-		return errors.New(message)
+		return &rewordedError{message, ErrGenerationChanged}
 	}
 	return nil
 }
@@ -202,28 +203,29 @@ func (t *transaction) wait(limit time.Duration, accept func(report [hid.ReportSi
 }
 
 // run performs one request. A channel another client is using is a RequestRejected with code 2.
+// A failure from before the first Set matches ErrNotSent.
 func (t *transaction) run(op byte, payload []byte) ([]byte, error) {
 	if len(payload) == 0 || len(payload) > t.rules.maxPayload {
-		return nil, errors.New(t.rules.sizeText)
+		return nil, NotSent(errors.New(t.rules.sizeText))
 	}
 	if t.active {
-		return nil, errors.New("The previous dongle request has not finished cancelling.")
+		return nil, NotSent(errors.New("The previous dongle request has not finished cancelling."))
 	}
 	t.attempted = false
 	current, err := currentGeneration(t.dev)
 	if err != nil {
-		return nil, err
+		return nil, NotSent(err)
 	}
 	if t.pinned && current != t.generation {
-		return nil, errors.New(generationChangedText)
+		return nil, NotSent(ErrGenerationChanged)
 	}
 	t.generation = current
 	initial, err := t.dev.Get(3)
 	if err != nil {
-		return nil, err
+		return nil, NotSent(err)
 	}
 	if initial[21] == phaseStaged || initial[21] == phaseProcessing {
-		return nil, &RequestRejected{2}
+		return nil, NotSent(&RequestRejected{2})
 	}
 	t.sequence = binary.LittleEndian.Uint32(initial[12:]) + 1
 	if t.sequence == 0 {
@@ -232,7 +234,11 @@ func (t *transaction) run(op byte, payload []byte) ([]byte, error) {
 	t.active = true
 	reply, err := t.exchange(op, payload)
 	if err != nil {
+		sent := t.attempted
 		t.cancel()
+		if !sent {
+			return nil, NotSent(err)
+		}
 		return nil, err
 	}
 	t.active = false

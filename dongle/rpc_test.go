@@ -37,6 +37,9 @@ func TestTypedRequestGenerationPin(t *testing.T) {
 	if err == nil || err.Error() != "Pico session changed; run the command again" {
 		t.Fatalf("err = %v", err)
 	}
+	if !errors.Is(err, ErrGenerationChanged) || !errors.Is(err, ErrNotSent) {
+		t.Fatalf("err = %v lost its identity", err)
+	}
 }
 
 func TestTypedRequestGenerationChanges(t *testing.T) {
@@ -51,8 +54,15 @@ func TestTypedRequestGenerationChanges(t *testing.T) {
 		cfg := sim.Default()
 		cfg.GenerationChangeAtGet = at
 		client, _ := newClient(cfg)
-		if _, err := client.TypedRequest([]byte{9}, nil); err == nil || err.Error() != want {
+		_, err := client.TypedRequest([]byte{9}, nil)
+		if err == nil || err.Error() != want {
 			t.Errorf("change at get %d: %v, want %q", at, err, want)
+		}
+		if !errors.Is(err, ErrGenerationChanged) {
+			t.Errorf("change at get %d: not ErrGenerationChanged", at)
+		}
+		if notSent := at == 3; errors.Is(err, ErrNotSent) != notSent {
+			t.Errorf("change at get %d: ErrNotSent should be %v", at, notSent)
 		}
 	}
 }

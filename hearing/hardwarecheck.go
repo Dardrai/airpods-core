@@ -205,7 +205,7 @@ func triggerCheck(exchange Exchanger) error {
 	handle := found[0].Handle
 	response, err := exchange([]byte{attWrite, byte(handle), byte(handle >> 8), '1'})
 	if err != nil {
-		return unconfirmed("No reply to the hardware check request, so it may or may not have started.", err)
+		return unconfirmedWrite("No reply to the hardware check request, so it may or may not have started.", err)
 	}
 	if !bytes.Equal(response, []byte{attWriteR}) {
 		return unconfirmed("The AirPods did not acknowledge the hardware check request.", errorText("Hardware check request.", response))
@@ -316,7 +316,7 @@ func StartHardwareCheck(c *dongle.Client, options HardwareCheckOptions) (*Hardwa
 	}
 	err = triggerCheck(func(pdu []byte) ([]byte, error) {
 		if err := safeToCheck(o, confirmed); err != nil {
-			return nil, err
+			return nil, dongle.NotSent(err)
 		}
 		return o.Exchange(pdu)
 	})

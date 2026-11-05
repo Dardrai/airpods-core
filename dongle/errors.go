@@ -48,6 +48,44 @@ func (e *RequestRejected) Error() string {
 // ErrRPCTimeout is the bounded wait expiring.
 var ErrRPCTimeout = errors.New("Pico diagnostic read timed out")
 
+// Conditions a caller can branch on with errors.Is. Errors may word them differently, and
+// keep their own text, while still matching.
+var (
+	// ErrGenerationChanged means the connection changed under a request pinned to it.
+	ErrGenerationChanged = errors.New(generationChangedText)
+	// ErrNotReady means the AirPods settings connection is not up yet.
+	ErrNotReady = errors.New("AirPods settings connection is not ready")
+	// ErrMicrophoneActive means settings cannot change while the microphone is in use.
+	ErrMicrophoneActive = errors.New("Stop microphone use before changing AirPods settings")
+	// ErrNotSent means a request failed before anything was handed to the device, so it
+	// cannot have applied. Any failure not matching it may have reached the dongle.
+	ErrNotSent = errors.New("The request was not sent")
+)
+
+// rewordedError shows its own text and matches the condition it wraps.
+type rewordedError struct {
+	text string
+	err  error
+}
+
+func (e *rewordedError) Error() string { return e.text }
+func (e *rewordedError) Unwrap() error { return e.err }
+
+// notSentError keeps an error's text and identity and adds ErrNotSent.
+type notSentError struct{ err error }
+
+func (e *notSentError) Error() string   { return e.err.Error() }
+func (e *notSentError) Unwrap() []error { return []error{e.err, ErrNotSent} }
+
+// NotSent marks an error as one from before anything was sent, for code that checks
+// preconditions around a Session. A nil error stays nil.
+func NotSent(err error) error {
+	if err == nil || errors.Is(err, ErrNotSent) {
+		return err
+	}
+	return &notSentError{err}
+}
+
 // Control receipt results (Status.ReceiptResult).
 const (
 	ResultOK           byte = 1

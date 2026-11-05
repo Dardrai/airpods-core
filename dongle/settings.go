@@ -313,17 +313,18 @@ func (s *SettingsClient) Read() (map[byte]Record, error) {
 
 // Set writes value to a setting of either table once and waits for a fresh matching
 // report. Errors are Unsupported or RequestRejected as raised, Unconfirmed once the
-// write may have applied, and plain errors from before the write.
+// write may have applied, and plain errors from before the write, which also match
+// ErrNotSent when they come from the write's own request.
 func (s *SettingsClient) Set(name string, value uint32) (string, error) {
 	setting, ok := LookupAnySetting(name)
 	if !ok {
 		return "", fmt.Errorf("unknown setting: %s", name)
 	}
 	if !s.status.ControlsReady {
-		return "", errors.New("AirPods settings connection is not ready")
+		return "", ErrNotReady
 	}
 	if s.status.MicrophoneActive {
-		return "", errors.New("Stop microphone use before changing AirPods settings")
+		return "", ErrMicrophoneActive
 	}
 	values, err := s.Read()
 	if err != nil {
@@ -366,10 +367,10 @@ func (s *SettingsClient) Send(name string, value uint32) (string, error) {
 		return "", fmt.Errorf("unknown setting: %s", name)
 	}
 	if !s.status.ControlsReady {
-		return "", errors.New("AirPods settings connection is not ready")
+		return "", ErrNotReady
 	}
 	if s.status.MicrophoneActive {
-		return "", errors.New("Stop microphone use before changing AirPods settings")
+		return "", ErrMicrophoneActive
 	}
 	if s.status.Capabilities&CapSettings == 0 {
 		return "", errors.New("Firmware does not advertise typed settings support")
@@ -380,7 +381,7 @@ func (s *SettingsClient) Send(name string, value uint32) (string, error) {
 	return fmt.Sprintf("%s: %s (sent)", name, setting.Decode(value)), nil
 }
 
-// write classifies failures of the write itself: rejected before applying, or uncertain.
+// write classifies failures of the write itself: not sent, rejected before applying, or uncertain.
 func (s *SettingsClient) write(name string, control byte, value uint32) error {
 	request := []byte{1, control, 0, 0, 0, 0}
 	binary.LittleEndian.PutUint32(request[2:], value)
@@ -391,6 +392,9 @@ func (s *SettingsClient) write(name string, control byte, value uint32) error {
 	}
 	if err == nil {
 		return nil
+	}
+	if errors.Is(err, ErrNotSent) {
+		return err
 	}
 	var unsupported *Unsupported
 	if errors.As(err, &unsupported) {

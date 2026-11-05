@@ -156,7 +156,7 @@ func (m *Modes) ExperimentalWriteTransparency(c *dongle.Client, expected, reques
 	pdu := append([]byte{found.WriteOpcode, byte(found.Handle), byte(found.Handle >> 8)}, written...)
 	response, err := o.Exchange(pdu)
 	if err != nil {
-		return TransparencySettings{}, unconfirmed("No reply to the Custom Transparency write. It may have applied; read it again.", err)
+		return TransparencySettings{}, unconfirmedWrite("No reply to the Custom Transparency write. It may have applied; read it again.", err)
 	}
 	if found.WriteOpcode == attWrite && !bytes.Equal(response, []byte{attWriteR}) {
 		return TransparencySettings{}, unconfirmed("The AirPods did not acknowledge Custom Transparency. Read it again.", errorText("Custom Transparency write.", response))
@@ -248,7 +248,7 @@ func ExperimentalSetLoudSoundReduction(c *dongle.Client, expected, requested boo
 	}
 	response, err = o.Exchange([]byte{attWrite, byte(loudSoundHandle), byte(loudSoundHandle >> 8), value})
 	if err != nil {
-		return current, unconfirmed("No reply to the Loud Sound Reduction write. It may have applied; read it again.", err)
+		return current, unconfirmedWrite("No reply to the Loud Sound Reduction write. It may have applied; read it again.", err)
 	}
 	if !bytes.Equal(response, []byte{attWriteR}) {
 		return current, unconfirmed("The AirPods did not acknowledge Loud Sound Reduction. Read it again.", errorText("Loud Sound Reduction write.", response))
@@ -289,7 +289,7 @@ func sendFailure(name string, err error) error {
 	if errors.As(err, &unsupported) || errors.As(err, &refusal) {
 		return err
 	}
-	return unconfirmed("Could not confirm "+name+" was sent. It may or may not have arrived.", err)
+	return unconfirmedWrite("Could not confirm "+name+" was sent. It may or may not have arrived.", err)
 }
 
 // ExperimentalSendEQ sends a custom EQ. There is no readback, so success is only ever
