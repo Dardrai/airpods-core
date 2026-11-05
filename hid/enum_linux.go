@@ -120,8 +120,10 @@ func readSysfsUevent(node string) (string, error) {
 	return string(data), err
 }
 
+// permissionError says what to do about a dongle that may not be opened; errors.Is still finds
+// os.ErrPermission in it.
 func permissionError(node string) error {
-	return fmt.Errorf("found %s but no permission to open it; install the AirPods udev rule; see the docs", node)
+	return systemError(fmt.Sprintf("found %s but no permission to open it; install the AirPods udev rule; see the docs", node), os.ErrPermission, nil)
 }
 
 // ueventUniq reads the USB serial from a hidraw node's sysfs uevent text.

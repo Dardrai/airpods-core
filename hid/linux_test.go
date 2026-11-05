@@ -142,7 +142,7 @@ func TestOpenNamesADeniedDongle(t *testing.T) {
 	}, func(node string) (string, error) {
 		return "HID_ID=0003:0000CAFE:00004005\n", nil
 	})
-	if err == nil || err.Error() != permissionError(path).Error() {
+	if err == nil || err.Error() != permissionError(path).Error() || !errors.Is(err, os.ErrPermission) {
 		t.Fatalf("err = %v", err)
 	}
 }
@@ -341,6 +341,9 @@ func TestDeniedDongleIsNamedOnlyWhenSysfsSaysItIsTheDongle(t *testing.T) {
 	want := "found /dev/hidraw3 but no permission to open it; install the AirPods udev rule; see the docs"
 	if got := permissionError("/dev/hidraw3").Error(); got != want {
 		t.Errorf("text %q", got)
+	}
+	if !errors.Is(permissionError("/dev/hidraw3"), os.ErrPermission) {
+		t.Error("the permission error should still match os.ErrPermission")
 	}
 }
 
