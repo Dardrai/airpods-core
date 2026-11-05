@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/Dardrai/airpods-core/dongle/sim"
+	"github.com/Dardrai/airpods-core/hid"
 )
 
 func TestControlFrameAndReceipt(t *testing.T) {
@@ -169,3 +170,40 @@ func TestListeningModeApplies(t *testing.T) {
 		t.Fatalf("anc = %d", status.ANC)
 	}
 }
+
+func TestACommandOnAClosedDeviceWasNotSent(t *testing.T) {
+	device := &closedDevice{Device: sim.New(sim.Default())}
+	client := NewClient(device)
+	client.SetClock(sim.NewVirtualClock())
+	err := client.Reconnect()
+	var unconfirmed *Unconfirmed
+	if errors.As(err, &unconfirmed) {
+		t.Errorf("wrapped as Unconfirmed: %v", err)
+	}
+	if !errors.Is(err, hid.ErrClosed) || !errors.Is(err, ErrNotSent) {
+		t.Errorf("err = %v", err)
+	}
+	if device.sets != 1 {
+		t.Errorf("%d Sets", device.sets)
+	}
+}
+
+// Any other failed Set may have reached the dongle.
+func TestACommandWhoseSetFailedOtherwiseIsUnconfirmed(t *testing.T) {
+	device := &failingSetDevice{Device: sim.New(sim.Default()), err: hid.ErrTimeout}
+	client := NewClient(device)
+	client.SetClock(sim.NewVirtualClock())
+	err := client.Reconnect()
+	var unconfirmed *Unconfirmed
+	if !errors.As(err, &unconfirmed) || !errors.Is(err, hid.ErrTimeout) || errors.Is(err, ErrNotSent) {
+		t.Errorf("err = %v", err)
+	}
+}
+
+// failingSetDevice fails every Set with err.
+type failingSetDevice struct {
+	*sim.Device
+	err error
+}
+
+func (d *failingSetDevice) Set([hid.ReportSize]byte) error { return d.err }

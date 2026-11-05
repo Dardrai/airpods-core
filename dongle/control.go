@@ -2,6 +2,7 @@ package dongle
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"time"
 
@@ -79,7 +80,8 @@ func validateCommand(status Status, opcode, arg byte) error {
 
 // Command sends one control report and waits up to 2 s for its receipt. A receipt
 // is tied to the sequence, not the generation, because pairing changes generation.
-// It returns ControlRejected when refused and Unconfirmed once the outcome is unknown.
+// It returns ControlRejected when refused and Unconfirmed once the outcome is unknown. A
+// report that a closed device refused matches ErrNotSent instead: it cannot have applied.
 func (c *Client) Command(opcode, arg byte) error {
 	if err := c.acquire(); err != nil {
 		return err
@@ -122,6 +124,9 @@ func (c *Client) Command(opcode, arg byte) error {
 		}
 	}
 	if err := c.dev.Set(data); err != nil {
+		if errors.Is(err, hid.ErrClosed) {
+			return NotSent(err) // A closed device sent nothing, so there is no outcome to doubt.
+		}
 		return unconfirmed(err)
 	}
 	deadline := c.clock.Now().Add(controlWait)
