@@ -120,7 +120,7 @@ func TestFailureCancelsAndIsNotRetried(t *testing.T) {
 	if _, err := session.Feature([]byte{9}); !errors.Is(err, ErrRPCTimeout) {
 		t.Fatalf("err %v", err)
 	}
-	if session.active {
+	if session.request.active {
 		t.Error("the cancel receipt was not seen")
 	}
 	if got := len(dev.Commits()); got != 1 {

@@ -179,11 +179,7 @@ func TestGenerationPinnedAcrossReads(t *testing.T) {
 func TestSendWritesOnceWithoutWaitingForAReport(t *testing.T) {
 	cfg := sim.Default()
 	cfg.WriteMode = sim.WriteLost
-	dev := sim.New(cfg)
-	settings, err := NewSettingsClient(dev)
-	if err != nil {
-		t.Fatal(err)
-	}
+	settings, dev := settingsFor(t, cfg)
 	got, err := settings.Send("conversation-awareness", 1)
 	if err != nil || got != "conversation-awareness: on (sent)" {
 		t.Fatalf("%q %v", got, err)
@@ -196,11 +192,7 @@ func TestSendWritesOnceWithoutWaitingForAReport(t *testing.T) {
 func TestSendChecksTheSameGatesAsSet(t *testing.T) {
 	cfg := sim.Default()
 	cfg.Flags = 0x13
-	dev := sim.New(cfg)
-	settings, err := NewSettingsClient(dev)
-	if err != nil {
-		t.Fatal(err)
-	}
+	settings, dev := settingsFor(t, cfg)
 	if _, err := settings.Send("mode", 3); err == nil {
 		t.Error("microphone use must refuse")
 	}

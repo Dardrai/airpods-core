@@ -8,8 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/Dardrai/airpods-core/hid"
 )
 
 // Kind selects how a setting's value is encoded.
@@ -286,11 +284,6 @@ type SettingsClient struct {
 	client     *Client
 	status     Status
 	generation uint32
-}
-
-// NewSettingsClient reads the status that pins the client to the current generation.
-func NewSettingsClient(dev hid.Device) (*SettingsClient, error) {
-	return NewClient(dev).SettingsClient()
 }
 
 // SettingsClient reads the status that pins a settings client to the current generation.

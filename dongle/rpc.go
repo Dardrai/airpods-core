@@ -70,21 +70,17 @@ func (c *Client) Status() (Status, error) {
 // TypedRequest runs one bounded report-3 request and never retries an uncertain
 // write. A non-nil generation pins the request to that connection generation.
 func (c *Client) TypedRequest(payload []byte, generation *uint32) ([]byte, error) {
+	return c.typedRequest(opFeature, payload, generation)
+}
+
+func (c *Client) typedRequest(op byte, payload []byte, generation *uint32) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return typedRequest(c.dev, c.clock, opFeature, payload, generation)
-}
-
-// TypedRequest runs one request directly on a device with the wall clock.
-func TypedRequest(dev hid.Device, payload []byte, generation *uint32) ([]byte, error) {
-	return typedRequest(dev, RealClock, opFeature, payload, generation)
-}
-
-type rpcSession struct {
-	dev        hid.Device
-	clock      Clock
-	generation uint32
-	sequence   uint32
+	t := &transaction{dev: c.dev, clock: c.clock, rules: typedRules}
+	if generation != nil {
+		t.generation, t.pinned = *generation, true
+	}
+	return t.run(op, payload)
 }
 
 func currentGeneration(dev hid.Device) (uint32, error) {
@@ -95,129 +91,234 @@ func currentGeneration(dev hid.Device) (uint32, error) {
 	return binary.LittleEndian.Uint32(raw[8:]), nil
 }
 
-func (r *rpcSession) checkGeneration(message string) error {
-	current, err := currentGeneration(r.dev)
+// transactionRules are what one kind of request allows and how it words its failures.
+type transactionRules struct {
+	maxPayload     int
+	sizeText       string
+	changedText    string // the generation changed during the request
+	changedEnd     string // the generation changed by the time the reply was complete
+	paginationText string
+	pageWait       time.Duration
+}
+
+var typedRules = transactionRules{
+	maxPayload:     maxFragment,
+	sizeText:       "Typed requests must fit one 1..42 byte HID fragment",
+	changedText:    "Pico session changed during request",
+	changedEnd:     "Pico session changed during read",
+	paginationText: "Invalid diagnostic pagination",
+	pageWait:       rpcWait,
+}
+
+var sessionRules = transactionRules{
+	maxPayload:     maxPayload,
+	sizeText:       "Invalid dongle settings payload length.",
+	changedText:    generationChangedText,
+	changedEnd:     generationChangedText,
+	paginationText: "Dongle returned an incomplete response.",
+	pageWait:       pageWait,
+}
+
+const generationChangedText = "Pico session changed; run the command again"
+
+// transaction is one report-3 request at a time on a device, under the client's lock: staging,
+// commit and paged reply. A failure cancels the request unless the dongle ended it itself, and
+// nothing here is ever retried.
+type transaction struct {
+	dev   hid.Device
+	clock Clock
+	rules transactionRules
+
+	generation uint32
+	pinned     bool // the generation is fixed; otherwise the request adopts the current one
+	sequence   uint32
+	active     bool // the dongle may still hold this request
+	attempted  bool // a Set of this request was tried, so it may have reached the dongle
+}
+
+func (t *transaction) checkGeneration(message string) error {
+	current, err := currentGeneration(t.dev)
 	if err != nil {
 		return err
 	}
-	if current != r.generation {
+	if current != t.generation {
 		return errors.New(message)
 	}
 	return nil
 }
 
-func (r *rpcSession) send(op byte, total, offset uint16, payload []byte) error {
-	if err := r.checkGeneration("Pico session changed during request"); err != nil {
+func (t *transaction) send(op byte, total, offset int, data []byte) error {
+	if err := t.checkGeneration(t.rules.changedText); err != nil {
 		return err
 	}
-	var data [hid.ReportSize]byte
-	header := hid.Header(3)
-	copy(data[:], header[:])
-	data[7] = op
-	le := binary.LittleEndian
-	le.PutUint32(data[8:], r.generation)
-	le.PutUint32(data[12:], r.sequence)
-	le.PutUint16(data[16:], total)
-	le.PutUint16(data[18:], offset)
-	data[20] = byte(len(payload))
-	copy(data[22:], payload)
-	return r.dev.Set(data)
+	t.attempted = true
+	return t.dev.Set(t.report(op, total, offset, data))
 }
 
-func (r *rpcSession) wait(phase byte, offset uint16) ([hid.ReportSize]byte, error) {
+func (t *transaction) report(op byte, total, offset int, data []byte) [hid.ReportSize]byte {
+	var report [hid.ReportSize]byte
+	header := hid.Header(3)
+	copy(report[:], header[:])
+	report[7] = op
+	le := binary.LittleEndian
+	le.PutUint32(report[8:], t.generation)
+	le.PutUint32(report[12:], t.sequence)
+	le.PutUint16(report[16:], uint16(total))
+	le.PutUint16(report[18:], uint16(offset))
+	report[20] = byte(len(data))
+	copy(report[22:], data)
+	return report
+}
+
+// wait polls report 3 until accept holds, a failure arrives or time runs out.
+func (t *transaction) wait(limit time.Duration, accept func(report [hid.ReportSize]byte) bool) ([hid.ReportSize]byte, error) {
 	var none [hid.ReportSize]byte
 	le := binary.LittleEndian
-	deadline := r.clock.Now().Add(rpcWait)
-	for r.clock.Now().Before(deadline) {
-		if err := r.checkGeneration("Pico session changed during request"); err != nil {
+	deadline := t.clock.Now().Add(limit)
+	for t.clock.Now().Before(deadline) {
+		if err := t.checkGeneration(t.rules.changedText); err != nil {
 			return none, err
 		}
-		data, err := r.dev.Get(3)
+		report, err := t.dev.Get(3)
 		if err != nil {
 			return none, err
 		}
-		if le.Uint32(data[8:]) == r.generation && le.Uint32(data[12:]) == r.sequence {
-			if data[21] == phaseFailed {
-				if data[22] == codeUnsupported {
+		if le.Uint32(report[8:]) == t.generation && le.Uint32(report[12:]) == t.sequence {
+			if report[21] == phaseFailed {
+				// The dongle has ended the request, so there is nothing left to cancel.
+				t.active = false
+				if report[22] == codeUnsupported {
 					return none, &Unsupported{"Firmware does not support this request for this device"}
 				}
-				return none, &RequestRejected{data[22]}
+				return none, &RequestRejected{report[22]}
 			}
-			if data[21] == phase && le.Uint16(data[18:]) == offset {
-				if data[20] > maxFragment {
-					return none, errors.New("Oversized HID page")
-				}
-				return data, nil
+			if accept(report) {
+				return report, nil
 			}
 		}
-		r.clock.Sleep(rpcPoll)
+		t.clock.Sleep(rpcPoll)
 	}
 	return none, ErrRPCTimeout
 }
 
-func typedRequest(dev hid.Device, clock Clock, op byte, payload []byte, generation *uint32) ([]byte, error) {
-	if len(payload) < 1 || len(payload) > maxFragment {
-		return nil, errors.New("Typed requests must fit one 1..42 byte HID fragment")
+// run performs one request. A channel another client is using is a RequestRejected with code 2.
+func (t *transaction) run(op byte, payload []byte) ([]byte, error) {
+	if len(payload) == 0 || len(payload) > t.rules.maxPayload {
+		return nil, errors.New(t.rules.sizeText)
 	}
-	current, err := currentGeneration(dev)
+	if t.active {
+		return nil, errors.New("The previous dongle request has not finished cancelling.")
+	}
+	t.attempted = false
+	current, err := currentGeneration(t.dev)
 	if err != nil {
 		return nil, err
 	}
-	if generation != nil && *generation != current {
-		return nil, errors.New("Pico session changed; run the command again")
+	if t.pinned && current != t.generation {
+		return nil, errors.New(generationChangedText)
 	}
-	initial, err := dev.Get(3)
+	t.generation = current
+	initial, err := t.dev.Get(3)
 	if err != nil {
 		return nil, err
 	}
 	if initial[21] == phaseStaged || initial[21] == phaseProcessing {
 		return nil, &RequestRejected{2}
 	}
-	le := binary.LittleEndian
-	sequence := le.Uint32(initial[12:]) + 1
-	if sequence == 0 {
-		sequence = 1
+	t.sequence = binary.LittleEndian.Uint32(initial[12:]) + 1
+	if t.sequence == 0 {
+		t.sequence = 1
 	}
-	session := &rpcSession{dev: dev, clock: clock, generation: current, sequence: sequence}
+	t.active = true
+	reply, err := t.exchange(op, payload)
+	if err != nil {
+		t.cancel()
+		return nil, err
+	}
+	t.active = false
+	return reply, nil
+}
 
-	if err := session.send(op, uint16(len(payload)), 0, payload); err != nil {
+func (t *transaction) exchange(op byte, payload []byte) ([]byte, error) {
+	le := binary.LittleEndian
+	for offset := 0; offset < len(payload); offset += maxFragment {
+		chunk := payload[offset:min(offset+maxFragment, len(payload))]
+		if err := t.send(op, len(payload), offset, chunk); err != nil {
+			return nil, err
+		}
+		end := offset + len(chunk)
+		if _, err := t.wait(rpcWait, func(r [hid.ReportSize]byte) bool {
+			return r[21] == phaseStaged && int(le.Uint16(r[16:])) == len(payload) && int(le.Uint16(r[18:])) == end
+		}); err != nil {
+			return nil, err
+		}
+	}
+	if err := t.send(opCommit, 0, 0, nil); err != nil {
 		return nil, err
 	}
-	if _, err := session.wait(phaseStaged, uint16(len(payload))); err != nil {
-		return nil, err
-	}
-	if err := session.send(opCommit, 0, 0, nil); err != nil {
-		return nil, err
-	}
-	page, err := session.wait(phaseReady, 0)
+	report, err := t.wait(rpcWait, func(r [hid.ReportSize]byte) bool {
+		return r[21] == phaseReady && le.Uint16(r[18:]) == 0
+	})
 	if err != nil {
 		return nil, err
 	}
-	total := int(le.Uint16(page[16:]))
+	total := int(le.Uint16(report[16:]))
 	if total > maxResponse {
 		return nil, errors.New("Invalid diagnostic length")
 	}
 	output := make([]byte, 0, total)
-	for total != 0 {
-		if int(le.Uint16(page[16:])) != total || page[20] == 0 {
-			return nil, errors.New("Invalid diagnostic pagination")
+	for {
+		size := int(report[20])
+		if size > maxFragment {
+			return nil, errors.New("Oversized HID page")
 		}
-		output = append(output, page[22:22+int(page[20])]...)
+		if int(le.Uint16(report[16:])) != total || int(le.Uint16(report[18:])) != len(output) || (size == 0 && len(output) < total) {
+			return nil, errors.New(t.rules.paginationText)
+		}
+		output = append(output, report[22:22+size]...)
 		if len(output) > total {
 			return nil, errors.New("Diagnostic page exceeds declared length")
 		}
 		if len(output) == total {
 			break
 		}
-		if err := session.send(opPage, 0, uint16(len(output)), nil); err != nil {
+		if err := t.send(opPage, 0, len(output), nil); err != nil {
 			return nil, err
 		}
-		if page, err = session.wait(phaseReady, uint16(len(output))); err != nil {
+		next := len(output)
+		report, err = t.wait(t.rules.pageWait, func(r [hid.ReportSize]byte) bool {
+			return r[21] == phaseReady && int(le.Uint16(r[18:])) == next
+		})
+		if err != nil {
 			return nil, err
 		}
 	}
-	if err := session.checkGeneration("Pico session changed during read"); err != nil {
+	if err := t.checkGeneration(t.rules.changedEnd); err != nil {
 		return nil, err
 	}
 	return output, nil
+}
+
+// cancel asks the dongle to drop the request and waits for its receipt, since later traffic
+// must not overtake it. A request that never reached a Set has nothing to drop.
+func (t *transaction) cancel() {
+	if !t.attempted {
+		t.active = false
+	}
+	if !t.active || t.send(opCancel, 0, 0, nil) != nil {
+		return
+	}
+	le := binary.LittleEndian
+	deadline := t.clock.Now().Add(cancelWait)
+	for t.clock.Now().Before(deadline) {
+		report, err := t.dev.Get(3)
+		if err != nil || le.Uint32(report[8:]) != t.generation {
+			return
+		}
+		if le.Uint32(report[12:]) == t.sequence && report[21] == phaseFailed && report[22] == codeCancelled {
+			t.active = false
+			return
+		}
+		t.clock.Sleep(rpcPoll)
+	}
 }

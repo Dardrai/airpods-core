@@ -274,3 +274,96 @@ func TestFeatureDecodersRejectBadLayouts(t *testing.T) {
 		}
 	}
 }
+
+// A failed request must not leave the channel busy for the next one, on a client or a session.
+func TestFailedRequestsAreCancelled(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*sim.Config)
+		clear  func(*sim.Config)
+	}{
+		{"commit timeout", func(c *sim.Config) { c.StallCommit = true }, func(c *sim.Config) { c.StallCommit = false }},
+		{"stage timeout", func(c *sim.Config) { c.StallStage = true }, func(c *sim.Config) { c.StallStage = false }},
+		{"commit stuck in phase 2", func(c *sim.Config) { c.CommitDelay = 100000 }, func(c *sim.Config) { c.CommitDelay = 0 }},
+		{"bad page", func(c *sim.Config) { c.Tamper = sim.TamperEmptyPage }, func(c *sim.Config) { c.Tamper = "" }},
+	} {
+		for _, kind := range []string{"client", "session"} {
+			t.Run(tc.name+"/"+kind, func(t *testing.T) {
+				cfg := sim.Default()
+				tc.mutate(&cfg)
+				client, device := newClient(cfg)
+				request := func() ([]byte, error) { return client.TypedRequest([]byte{9}, nil) }
+				if kind == "session" {
+					session, err := client.OpenSession()
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer session.Close()
+					request = func() ([]byte, error) { return session.Feature([]byte{9}) }
+				}
+				if _, err := request(); err == nil {
+					t.Fatal("expected the first request to fail")
+				}
+				device.Update(tc.clear)
+				if _, err := request(); err != nil {
+					t.Fatalf("the next request: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestRejectedAndUnsentRequestsAreNotCancelled(t *testing.T) {
+	const cancelOp = 5
+	for _, tc := range []struct {
+		name   string
+		mutate func(*sim.Config)
+	}{
+		{"the dongle ended it", func(c *sim.Config) { c.Fail = map[byte]byte{9: 5} }},
+		{"unsupported", func(c *sim.Config) { c.Fail = map[byte]byte{9: 7} }},
+		{"busy before anything was sent", func(c *sim.Config) { c.InitialPhase = 2 }},
+		{"the generation moved before the first Set", func(c *sim.Config) { c.GenerationChangeAtGet = 3 }},
+		{"a read failed before the first Set", func(c *sim.Config) { c.GetFailAt = 2 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := sim.Default()
+			tc.mutate(&cfg)
+			device := &recordingDevice{Device: sim.New(cfg)}
+			client := NewClient(device)
+			client.SetClock(sim.NewVirtualClock())
+			if _, err := client.TypedRequest([]byte{9}, nil); err == nil {
+				t.Fatal("expected a failure")
+			}
+			if device.ops[cancelOp] != 0 {
+				t.Errorf("sent %d cancels", device.ops[cancelOp])
+			}
+		})
+	}
+}
+
+// recordingDevice counts the report 3 operations asked of a device.
+type recordingDevice struct {
+	*sim.Device
+	ops [256]int
+}
+
+func (d *recordingDevice) Set(data [hid.ReportSize]byte) error {
+	if data[0] == 3 {
+		d.ops[data[7]]++
+	}
+	return d.Device.Set(data)
+}
+
+func TestSetFailureStillCancels(t *testing.T) {
+	cfg := sim.Default()
+	cfg.SetFailAt = 2 // the commit
+	device := &recordingDevice{Device: sim.New(cfg)}
+	client := NewClient(device)
+	client.SetClock(sim.NewVirtualClock())
+	if _, err := client.TypedRequest([]byte{9}, nil); err == nil {
+		t.Fatal("expected a failure")
+	}
+	if device.ops[5] != 1 {
+		t.Errorf("sent %d cancels", device.ops[5])
+	}
+}

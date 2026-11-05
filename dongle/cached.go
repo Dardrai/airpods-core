@@ -45,9 +45,7 @@ func (c *Client) Cached(slot byte) (*Cached, error) {
 	if slot < SlotMetadata || slot > SlotEarStatus {
 		return nil, errors.New("Unknown dongle report.")
 	}
-	c.mu.Lock()
-	reply, err := typedRequest(c.dev, c.clock, opCached, []byte{slot}, nil)
-	c.mu.Unlock()
+	reply, err := c.typedRequest(opCached, []byte{slot}, nil)
 	if err != nil {
 		return nil, err
 	}
