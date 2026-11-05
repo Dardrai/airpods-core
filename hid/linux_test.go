@@ -5,9 +5,13 @@ package hid
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"reflect"
+	"sync"
 	"syscall"
 	"testing"
+	"time"
+	"unsafe"
 )
 
 // Compile-time: each constant must equal its documented kernel value.
@@ -102,10 +106,158 @@ func TestSelectNodes(t *testing.T) {
 	}
 }
 
+// noNodes matches nothing, and the seams fail the test if they are ever reached: these
+// tests must not touch a real /dev/hidraw node, whatever is plugged in.
+func noNodes(t *testing.T) (string, func(string) (rawNode, error), func(string) (string, error)) {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "hidraw*"),
+		func(path string) (rawNode, error) {
+			t.Errorf("opened %s", path)
+			return nil, os.ErrNotExist
+		},
+		func(node string) (string, error) {
+			t.Errorf("read uevent of %s", node)
+			return "", os.ErrNotExist
+		}
+}
+
 func TestOpenWithoutDevicesReportsExpectedText(t *testing.T) {
-	if _, err := Open("definitely-not-a-serial"); err == nil ||
+	pattern, open, read := noNodes(t)
+	_, _, err := openNodes(pattern, "definitely-not-a-serial", open, read)
+	var mismatch *MatchError
+	if !errors.As(err, &mismatch) || mismatch.Found != 0 ||
 		err.Error() != "Expected exactly one matching Pico HID interface (CAFE:4015/4005)" {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestOpenNamesADeniedDongle(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hidraw3")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := openNodes(filepath.Join(dir, "hidraw*"), "", func(string) (rawNode, error) {
+		return nil, syscall.EACCES
+	}, func(node string) (string, error) {
+		return "HID_ID=0003:0000CAFE:00004005\n", nil
+	})
+	if err == nil || err.Error() != permissionError(path).Error() {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// fakeDevice stands in for the kernel: it copies reply into the buffer and returns result.
+func fakeDevice(result int, err error, reply [ReportSize]byte) *device {
+	d := newDevice(99, "S1")
+	d.ioctl = func(_ int, _ uintptr, arg unsafe.Pointer) (int, error) {
+		*(*[ReportSize]byte)(arg) = reply
+		return result, err
+	}
+	d.closeFD = func(int) error { return nil }
+	return d
+}
+
+func TestGetRequiresTheWholeReport(t *testing.T) {
+	var good [ReportSize]byte
+	header := Header(2)
+	copy(good[:], header[:])
+	if got, err := fakeDevice(ReportSize, nil, good).Get(2); err != nil || got != good {
+		t.Fatalf("full report: %v", err)
+	}
+	if _, err := fakeDevice(ReportSize-1, nil, good).Get(2); !errors.Is(err, errIncomplete) {
+		t.Fatalf("short report: %v", err)
+	}
+	if _, err := fakeDevice(0, nil, good).Get(2); !errors.Is(err, errIncomplete) {
+		t.Fatalf("empty report: %v", err)
+	}
+	if _, err := fakeDevice(ReportSize, nil, [ReportSize]byte{}).Get(2); !errors.Is(err, ErrUnsupportedReport) {
+		t.Fatalf("wrong identity: %v", err)
+	}
+	if _, err := fakeDevice(0, syscall.ENODEV, good).Get(2); !errors.Is(err, ErrDisconnected) || !errors.Is(err, syscall.ENODEV) {
+		t.Fatalf("gone: %v", err)
+	}
+	if _, err := fakeDevice(0, syscall.ETIMEDOUT, good).Get(2); !errors.Is(err, ErrTimeout) {
+		t.Fatalf("timeout: %v", err)
+	}
+	if err := fakeDevice(1, nil, good).Set(good); err != nil {
+		t.Fatalf("a Set needs no full count, as on Windows: %v", err)
+	}
+}
+
+func TestGetRetriesAnInterruptedRead(t *testing.T) {
+	var good [ReportSize]byte
+	header := Header(3)
+	copy(good[:], header[:])
+	calls := 0
+	d := newDevice(99, "S1")
+	d.ioctl = func(_ int, _ uintptr, arg unsafe.Pointer) (int, error) {
+		if calls++; calls == 1 {
+			return 0, syscall.EINTR
+		}
+		*(*[ReportSize]byte)(arg) = good
+		return ReportSize, nil
+	}
+	if _, err := d.Get(3); err != nil || calls != 2 {
+		t.Fatalf("calls %d: %v", calls, err)
+	}
+}
+
+func TestCloseWaitsForTheTransferInFlight(t *testing.T) {
+	started, finish := make(chan struct{}), make(chan struct{})
+	var mu sync.Mutex
+	var order []string
+	note := func(what string) {
+		mu.Lock()
+		defer mu.Unlock()
+		order = append(order, what)
+	}
+	d := newDevice(99, "S1")
+	d.ioctl = func(fd int, _ uintptr, _ unsafe.Pointer) (int, error) {
+		close(started)
+		<-finish
+		note("transfer done")
+		return ReportSize, nil
+	}
+	closes := 0
+	d.closeFD = func(fd int) error {
+		closes++
+		note("closed")
+		return nil
+	}
+	transfer := make(chan error)
+	go func() { transfer <- d.Set([ReportSize]byte{}) }()
+	<-started
+	closed := make(chan error)
+	go func() { closed <- d.Close() }()
+	select {
+	case <-closed:
+		t.Fatal("Close did not wait for the transfer")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(finish)
+	if err := <-transfer; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(order, []string{"transfer done", "closed"}) {
+		t.Fatalf("order %v", order)
+	}
+
+	d.ioctl = func(int, uintptr, unsafe.Pointer) (int, error) {
+		t.Error("a transfer used the descriptor after Close")
+		return 0, nil
+	}
+	if _, err := d.Get(2); !errors.Is(err, ErrClosed) {
+		t.Errorf("Get after Close: %v", err)
+	}
+	if err := d.Set([ReportSize]byte{}); !errors.Is(err, ErrClosed) {
+		t.Errorf("Set after Close: %v", err)
+	}
+	if err := d.Close(); err != nil || closes != 1 {
+		t.Errorf("second Close: %v, %d closes", err, closes)
 	}
 }
 
@@ -285,7 +437,8 @@ func TestListNodes(t *testing.T) {
 }
 
 func TestEnumerateWithoutDevices(t *testing.T) {
-	if got, err := Enumerate(); err != nil || len(got) != 0 {
+	pattern, open, read := noNodes(t)
+	if got, err := enumerateNodes(pattern, open, read); err != nil || len(got) != 0 {
 		t.Fatalf("%+v %v", got, err)
 	}
 }

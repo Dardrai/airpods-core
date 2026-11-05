@@ -28,7 +28,7 @@ func (n fdNode) info() (uint16, uint16, error) {
 		bustype  uint32
 		vid, pid uint16
 	}
-	if err := ioctl(int(n), hidiocGRawInfo, unsafe.Pointer(&raw)); err != nil {
+	if _, err := ioctl(int(n), hidiocGRawInfo, unsafe.Pointer(&raw)); err != nil {
 		return 0, 0, err
 	}
 	return raw.vid, raw.pid, nil
@@ -36,7 +36,7 @@ func (n fdNode) info() (uint16, uint16, error) {
 
 func (n fdNode) uniq() (string, error) {
 	var buf [256]byte
-	if err := ioctl(int(n), hidiocGRawUniq, unsafe.Pointer(&buf)); err != nil {
+	if _, err := ioctl(int(n), hidiocGRawUniq, unsafe.Pointer(&buf)); err != nil {
 		return "", err
 	}
 	value, _, _ := bytes.Cut(buf[:], []byte{0})
@@ -183,48 +183,58 @@ func describeNode(path string, open func(string) (rawNode, error), readUevent fu
 	return Info{Path: path, Serial: ueventUniq(uevent), PID: pid, Err: openErr}, true
 }
 
-func openNode(path string) (int, error) {
-	return syscall.Open(path, syscall.O_RDWR|syscall.O_CLOEXEC, 0)
+// hidrawNodes is what the real Open and Enumerate look through.
+const hidrawNodes = "/dev/hidraw*"
+
+func openFDNode(path string) (rawNode, error) {
+	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	return fdNode(fd), nil
 }
 
 // Enumerate lists every attached dongle without keeping any of them open. No dongle is
 // an empty list, not an error.
 func Enumerate() ([]Info, error) {
-	paths, err := filepath.Glob("/dev/hidraw*")
+	return enumerateNodes(hidrawNodes, openFDNode, readSysfsUevent)
+}
+
+func enumerateNodes(pattern string, open func(string) (rawNode, error), readUevent func(node string) (string, error)) ([]Info, error) {
+	paths, err := filepath.Glob(pattern)
 	if err != nil {
 		return nil, err
 	}
-	return listNodes(paths, func(path string) (rawNode, error) {
-		fd, err := openNode(path)
-		if err != nil {
-			return nil, err
-		}
-		return fdNode(fd), nil
-	}, readSysfsUevent), nil
+	return listNodes(paths, open, readUevent), nil
 }
 
 // Open finds exactly one hidraw node of the dongle, optionally by USB serial.
 func Open(serial string) (Device, error) {
-	paths, err := filepath.Glob("/dev/hidraw*")
+	node, unique, err := openNodes(hidrawNodes, serial, openFDNode, readSysfsUevent)
 	if err != nil {
 		return nil, err
+	}
+	return newDevice(int(node.(fdNode)), unique), nil
+}
+
+func openNodes(pattern, serial string, open func(string) (rawNode, error), readUevent func(node string) (string, error)) (rawNode, string, error) {
+	paths, err := filepath.Glob(pattern)
+	if err != nil {
+		return nil, "", err
 	}
 	var denied []string
 	node, unique, err := selectNodes(paths, serial, func(path string) (rawNode, error) {
-		fd, err := openNode(path)
-		if err != nil {
-			if errors.Is(err, os.ErrPermission) {
-				denied = append(denied, path)
-			}
-			return nil, err
+		node, err := open(path)
+		if errors.Is(err, os.ErrPermission) {
+			denied = append(denied, path)
 		}
-		return fdNode(fd), nil
+		return node, err
 	})
 	if err != nil {
-		if found := deniedDongle(denied, readSysfsUevent); found != "" {
-			return nil, permissionError(found)
+		if found := deniedDongle(denied, readUevent); found != "" {
+			return nil, "", permissionError(found)
 		}
-		return nil, err
+		return nil, "", err
 	}
-	return &device{fd: int(node.(fdNode)), serial: unique}, nil
+	return node, unique, nil
 }

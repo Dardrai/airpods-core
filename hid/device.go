@@ -15,8 +15,13 @@ const (
 	ProductControl = 0x4005
 )
 
-// Device is one opened dongle. Get verifies the report identity; implementations
-// are not safe for concurrent use.
+// Device is one opened dongle. Get verifies the report identity. The devices Open returns
+// let Close wait for a transfer in flight and fail later transfers with ErrClosed, but they
+// do not keep multi-report protocol transactions together: use one dongle.Client for that.
+//
+// One transfer is bounded by the system rather than by a context: 400 ms on Windows
+// (ErrFeatureTimeout), and on Linux by the kernel's USB control timeout of about 5 s, which
+// hidraw offers no way to shorten or interrupt. It surfaces as ErrTimeout.
 type Device interface {
 	Get(report byte) ([ReportSize]byte, error)
 	Set(data [ReportSize]byte) error
@@ -35,6 +40,8 @@ var (
 	ErrDisconnected = errors.New("HID device disconnected")
 	// ErrTimeout means one transfer ran out of time. It may still have reached the device.
 	ErrTimeout = errors.New("HID transfer timed out")
+	// ErrClosed means the transfer was asked for after Close, and nothing was sent.
+	ErrClosed = errors.New("HID device is closed")
 )
 
 // wrappedError shows its own text and wraps the OS error and the condition behind it.

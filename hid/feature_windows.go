@@ -5,6 +5,7 @@ package hid
 import (
 	"errors"
 	"runtime"
+	"sync"
 
 	"golang.org/x/sys/windows"
 )
@@ -22,8 +23,12 @@ type transfer struct {
 	buffer     [ReportSize]byte
 }
 
+// device owns one handle. mu is held across each transfer, so Close cannot release the handle
+// while a transfer may still use it.
 type device struct {
+	mu     sync.Mutex
 	handle windows.Handle
+	closed bool
 	serial string
 }
 
@@ -71,6 +76,11 @@ func (o *windowsOps) result(wait bool) (uint32, error) {
 }
 
 func (d *device) feature(writing bool, data *[ReportSize]byte) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return ErrClosed
+	}
 	event, err := windows.CreateEvent(nil, 1, 0, nil)
 	if err != nil {
 		return winError(err)
@@ -105,11 +115,13 @@ func (d *device) Set(data [ReportSize]byte) error {
 
 func (d *device) Serial() string { return d.serial }
 
+// Close waits for a transfer in flight. Closing twice is harmless.
 func (d *device) Close() error {
-	if d.handle == windows.InvalidHandle {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
 		return nil
 	}
-	err := windows.CloseHandle(d.handle)
-	d.handle = windows.InvalidHandle
-	return err
+	d.closed = true
+	return windows.CloseHandle(d.handle)
 }

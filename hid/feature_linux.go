@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"syscall"
 	"unsafe"
 )
@@ -23,12 +24,13 @@ func ioc(dir, typ, nr, size uintptr) uintptr {
 	return dir<<30 | size<<16 | typ<<8 | nr
 }
 
-func ioctl(fd int, request uintptr, arg unsafe.Pointer) error {
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), request, uintptr(arg))
+// ioctl returns the call's result, which for the feature requests is the transferred length.
+func ioctl(fd int, request uintptr, arg unsafe.Pointer) (int, error) {
+	result, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), request, uintptr(arg))
 	if errno != 0 {
-		return errno
+		return 0, errno
 	}
-	return nil
+	return int(result), nil
 }
 
 // errnoKind names the cross-platform condition of an errno, if it has one.
@@ -52,21 +54,42 @@ func osError(err error) error {
 	return err
 }
 
+// device owns one hidraw descriptor. mu is held across each transfer, so Close cannot release
+// the number while a transfer may still use it: the kernel could hand it to an unrelated file
+// the moment it is free, and a report would then go there.
 type device struct {
-	fd     int
-	serial string
+	mu      sync.Mutex
+	fd      int
+	closed  bool
+	serial  string
+	ioctl   func(fd int, request uintptr, arg unsafe.Pointer) (int, error)
+	closeFD func(fd int) error
 }
 
+func newDevice(fd int, serial string) *device {
+	return &device{fd: fd, serial: serial, ioctl: ioctl, closeFD: syscall.Close}
+}
+
+// Get requires the whole report, as the Windows transport does. Each ioctl waits at most for
+// the kernel's USB control timeout; see Device.
 func (d *device) Get(report byte) ([ReportSize]byte, error) {
 	buf := new([ReportSize]byte)
 	buf[0] = report
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return *buf, ErrClosed
+	}
 	for {
-		err := ioctl(d.fd, hidiocGFeature, unsafe.Pointer(buf))
+		count, err := d.ioctl(d.fd, hidiocGFeature, unsafe.Pointer(buf))
 		if errors.Is(err, syscall.EINTR) {
 			continue
 		}
 		if err != nil {
 			return *buf, osError(err)
+		}
+		if count != ReportSize {
+			return *buf, errIncomplete
 		}
 		return *buf, CheckReport(report, *buf)
 	}
@@ -76,7 +99,12 @@ func (d *device) Get(report byte) ([ReportSize]byte, error) {
 func (d *device) Set(data [ReportSize]byte) error {
 	buf := new([ReportSize]byte)
 	*buf = data
-	if err := ioctl(d.fd, hidiocSFeature, unsafe.Pointer(buf)); err != nil {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
+		return ErrClosed
+	}
+	if _, err := d.ioctl(d.fd, hidiocSFeature, unsafe.Pointer(buf)); err != nil {
 		return osError(err)
 	}
 	return nil
@@ -84,11 +112,13 @@ func (d *device) Set(data [ReportSize]byte) error {
 
 func (d *device) Serial() string { return d.serial }
 
+// Close waits for a transfer in flight. Closing twice is harmless.
 func (d *device) Close() error {
-	if d.fd < 0 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.closed {
 		return nil
 	}
-	err := syscall.Close(d.fd)
-	d.fd = -1
-	return err
+	d.closed = true
+	return d.closeFD(d.fd)
 }
