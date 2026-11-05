@@ -101,6 +101,9 @@ func TestContextEndsASettingConfirmation(t *testing.T) {
 	if !errors.As(err, &unconfirmed) || !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v", err)
 	}
+	if errors.Is(err, ErrNotSent) {
+		t.Error("the write had gone out")
+	}
 	if device.Writes() != 1 {
 		t.Errorf("writes %d", device.Writes())
 	}

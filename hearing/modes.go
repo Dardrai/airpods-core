@@ -310,7 +310,8 @@ type ModeResult struct {
 // ModeUnconfirmed means packets went out but the AirPods have not confirmed the outcome,
 // so the mode may be in either state. Recovery says what the user should be offered; for
 // an enable it is to turn the mode off with Modes.StartRecover, which is possible without any
-// new report. Nothing is resent automatically.
+// new report. Nothing is resent automatically. Like dongle.Unconfirmed it never matches
+// dongle.ErrNotSent, whatever Err does.
 type ModeUnconfirmed struct {
 	Mode     Mode
 	On       bool
@@ -320,7 +321,9 @@ type ModeUnconfirmed struct {
 }
 
 func (e *ModeUnconfirmed) Error() string { return e.Message }
-func (e *ModeUnconfirmed) Unwrap() error { return e.Err }
+
+// Unwrap gives the cause as a dongle.Unconfirmed gives it, which is without dongle.ErrNotSent.
+func (e *ModeUnconfirmed) Unwrap() error { return errors.Unwrap(unconfirmed(e.Message, e.Err)) }
 
 // Recovery is the action offered after an unconfirmed change: turn this mode off.
 type Recovery struct{ Mode Mode }

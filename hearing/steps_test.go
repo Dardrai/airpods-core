@@ -389,6 +389,16 @@ func TestLaterPacketFailureStaysUnconfirmed(t *testing.T) {
 	if !errors.As(err, &unconfirmed) || unconfirmed.Recovery == nil {
 		t.Fatalf("err %#v", err)
 	}
+	if !errors.Is(unconfirmed.Err, dongle.ErrNotSent) {
+		t.Fatalf("the later packet should have failed before it went out: %v", unconfirmed.Err)
+	}
+	if errors.Is(err, dongle.ErrNotSent) {
+		t.Error("the first packet went out, yet the error matches ErrNotSent")
+	}
+	var rejected *dongle.RequestRejected
+	if !errors.As(err, &rejected) || rejected.Code != 3 {
+		t.Errorf("lost its cause: %v", err)
+	}
 }
 
 func TestSentinelsMatchWithTheirTextUnchanged(t *testing.T) {
@@ -445,6 +455,9 @@ func TestAnEndedContextEndsAModeChangeAsUnconfirmed(t *testing.T) {
 	if !errors.As(err, &unconfirmed) || unconfirmed.Recovery == nil || !errors.Is(err, context.Canceled) {
 		t.Fatalf("err %v", err)
 	}
+	if errors.Is(err, dongle.ErrNotSent) {
+		t.Error("the change went out, yet the error matches ErrNotSent")
+	}
 	if len(a.Received) != sent {
 		t.Error("sent something while stopping")
 	}
@@ -480,4 +493,87 @@ func TestAnEndedContextEndsAProfileApply(t *testing.T) {
 		}
 	}
 	t.Fatal("kept going")
+}
+
+// reconnectingDevice starts a new generation on the nth status read after the first ATT write.
+type reconnectingDevice struct {
+	*sim.Device
+	airpods   *sim.HearingAirPods
+	at, reads int
+}
+
+func (d *reconnectingDevice) Get(report byte) ([hid.ReportSize]byte, error) {
+	if report == 2 && d.airpods.Server.Writes > 0 {
+		if d.reads++; d.reads == d.at {
+			d.BumpGeneration()
+		}
+	}
+	return d.Device.Get(report)
+}
+
+// A read back that fails before it goes out says nothing about the write before it: wherever
+// a reconnect lands after the write, the outcome is unconfirmed and never ErrNotSent.
+func TestAReconnectAfterAWriteIsNeverErrNotSent(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		write func(t *testing.T, client *dongle.Client) error
+	}{
+		{"profile", func(t *testing.T, client *dongle.Client) error {
+			modes := new(Modes)
+			expected := readBaseline(t, client, modes)
+			requested := expected
+			requested.OwnVoice = 0.25
+			_, err := modes.ApplyProfile(client, expected, requested)
+			return err
+		}},
+		{"transparency", func(t *testing.T, client *dongle.Client) error {
+			modes := new(Modes)
+			expected, err := modes.ExperimentalReadTransparency(client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			requested := expected
+			requested.RightTone = 0.25
+			_, err = modes.ExperimentalWriteTransparency(client, expected, requested)
+			return err
+		}},
+		{"loud sound", func(t *testing.T, client *dongle.Client) error {
+			_, err := ExperimentalSetLoudSoundReduction(client, false, true)
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			unsentReads, finished := 0, false
+			for at := 1; at <= 200 && !finished; at++ {
+				a := enabled()
+				device := &reconnectingDevice{Device: sim.New(a.Config()), airpods: a, at: at}
+				client := dongle.NewClient(device)
+				client.SetClock(sim.NewVirtualClock())
+				err := tc.write(t, client)
+				if a.Server.Writes != 1 {
+					t.Fatalf("reconnect at read %d: writes %d", at, a.Server.Writes)
+				}
+				if err == nil {
+					finished = true // The reconnect came after everything was confirmed.
+					continue
+				}
+				var unconfirmed *dongle.Unconfirmed
+				if !errors.As(err, &unconfirmed) || !errors.Is(err, dongle.ErrGenerationChanged) {
+					t.Fatalf("reconnect at read %d: %v", at, err)
+				}
+				if errors.Is(err, dongle.ErrNotSent) {
+					t.Errorf("reconnect at read %d: the write went out, yet the error matches ErrNotSent", at)
+				}
+				if errors.Is(unconfirmed.Err, dongle.ErrNotSent) {
+					unsentReads++
+				}
+			}
+			if unsentReads == 0 {
+				t.Error("no reconnect landed before a read back went out")
+			}
+			if !finished {
+				t.Error("the reconnect never came late enough for the write to finish")
+			}
+		})
+	}
 }

@@ -1,10 +1,12 @@
 package dongle
 
 import (
+	"context"
 	"errors"
 	"testing"
 
 	"github.com/Dardrai/airpods-core/dongle/sim"
+	"github.com/Dardrai/airpods-core/hid"
 )
 
 func settingsFor(t *testing.T, cfg sim.Config) (*SettingsClient, *sim.Device) {
@@ -349,5 +351,99 @@ func TestPreconditionsAreReadAgainForEachWrite(t *testing.T) {
 				t.Error("wrote across a generation")
 			}
 		})
+	}
+}
+
+// reconnectingDevice starts a new generation on the nth status read after a setting write.
+type reconnectingDevice struct {
+	*sim.Device
+	at, reads int
+}
+
+func (d *reconnectingDevice) Get(report byte) ([hid.ReportSize]byte, error) {
+	if report == 2 && d.Writes() > 0 {
+		if d.reads++; d.reads == d.at {
+			d.BumpGeneration()
+		}
+	}
+	return d.Device.Get(report)
+}
+
+// A confirming read that fails before it goes out says nothing about the write before it:
+// wherever a reconnect lands after the write, the outcome is Unconfirmed and never ErrNotSent.
+func TestAReconnectAfterASettingWriteIsNeverErrNotSent(t *testing.T) {
+	unsentReads := 0
+	for at := 1; at <= 12; at++ {
+		cfg := sim.Default()
+		cfg.WriteMode = sim.WriteLost
+		device := &reconnectingDevice{Device: sim.New(cfg), at: at}
+		client := NewClient(device)
+		client.SetClock(sim.NewVirtualClock())
+		settings, err := client.SettingsClient()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = settings.Set("mode", 1)
+		var unconfirmed *Unconfirmed
+		if !errors.As(err, &unconfirmed) || !errors.Is(err, ErrGenerationChanged) {
+			t.Fatalf("reconnect at read %d: %v", at, err)
+		}
+		if errors.Is(err, ErrNotSent) {
+			t.Errorf("reconnect at read %d: the write went out, yet the error matches ErrNotSent", at)
+		}
+		if errors.Is(unconfirmed.Err, ErrNotSent) {
+			unsentReads++
+		}
+		if device.Writes() != 1 {
+			t.Errorf("reconnect at read %d: writes %d", at, device.Writes())
+		}
+	}
+	if unsentReads == 0 {
+		t.Error("no reconnect landed before a confirming read went out")
+	}
+}
+
+func TestUnconfirmedKeepsItsCauseButNeverMatchesErrNotSent(t *testing.T) {
+	reworded := &rewordedError{"reworded", ErrGenerationChanged}
+	for name, cause := range map[string]error{
+		"context":    NotSent(context.Canceled),
+		"generation": NotSent(reworded),
+		"busy":       NotSent(&RequestRejected{2}),
+		"transport":  NotSent(hid.ErrDisconnected),
+		"wrapped":    &rewordedError{"outer", NotSent(context.Canceled)},
+	} {
+		err := error(&Unconfirmed{Message: "not confirmed", Err: cause})
+		if errors.Is(err, ErrNotSent) {
+			t.Errorf("%s: matches ErrNotSent", name)
+		}
+		if got := errors.Unwrap(err); got == nil || got.Error() != cause.Error() {
+			t.Errorf("%s: cause %v", name, got)
+		}
+		var rejected *RequestRejected
+		switch name {
+		case "context", "wrapped":
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("%s: lost context.Canceled", name)
+			}
+		case "generation":
+			if !errors.Is(err, ErrGenerationChanged) {
+				t.Errorf("%s: lost ErrGenerationChanged", name)
+			}
+		case "busy":
+			if !errors.As(err, &rejected) || rejected.Code != 2 {
+				t.Errorf("%s: lost the rejection", name)
+			}
+		case "transport":
+			if !errors.Is(err, hid.ErrDisconnected) {
+				t.Errorf("%s: lost hid.ErrDisconnected", name)
+			}
+		}
+	}
+	plain := errors.New("boom")
+	if got := errors.Unwrap(&Unconfirmed{Err: plain}); got != plain {
+		t.Errorf("a cause that was sent should come back as it is: %v", got)
+	}
+	if got := errors.Unwrap(&Unconfirmed{}); got != nil {
+		t.Errorf("no cause: %v", got)
 	}
 }

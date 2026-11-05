@@ -5,14 +5,17 @@ import (
 	"strconv"
 )
 
-// Unconfirmed means a write may have applied but no confirmation arrived (exit 3).
+// Unconfirmed means a write may have applied but no confirmation arrived (exit 3). It never
+// matches ErrNotSent, even when Err does: Err is then a later request, such as a confirming
+// read, that did not go out, which says nothing about the write. Whatever else Err matches,
+// such as a context error or ErrGenerationChanged, the Unconfirmed matches too.
 type Unconfirmed struct {
 	Message string
 	Err     error
 }
 
 func (e *Unconfirmed) Error() string { return e.Message }
-func (e *Unconfirmed) Unwrap() error { return e.Err }
+func (e *Unconfirmed) Unwrap() error { return sent(e.Err) }
 
 // Unsupported means the device refused a request as unsupported (phase 4, code 7).
 type Unsupported struct{ Message string }
@@ -76,6 +79,24 @@ type notSentError struct{ err error }
 
 func (e *notSentError) Error() string   { return e.err.Error() }
 func (e *notSentError) Unwrap() []error { return []error{e.err, ErrNotSent} }
+
+// sentError keeps an error's text and what it matches, except ErrNotSent. It has no Unwrap,
+// so errors.Is and errors.As see the chain only through its methods.
+type sentError struct{ err error }
+
+func (e *sentError) Error() string        { return e.err.Error() }
+func (e *sentError) Is(target error) bool { return target != ErrNotSent && errors.Is(e.err, target) }
+func (e *sentError) As(target any) bool   { return errors.As(e.err, target) }
+
+// sent is for the cause of a failure that follows a write which went out: it takes ErrNotSent
+// off an error and leaves the rest of its identity, since a later request that was not sent
+// does not make the write unsent. Other errors, and nil, come back as they are.
+func sent(err error) error {
+	if !errors.Is(err, ErrNotSent) {
+		return err
+	}
+	return &sentError{err}
+}
 
 // NotSent marks an error as one from before anything was sent, for code that checks
 // preconditions around a Session. A nil error stays nil.
