@@ -51,6 +51,7 @@ type checkJob struct {
 	phase    CheckPhase
 	updated  [2]bool
 	message  string
+	err      error
 }
 
 func newCheckJob(baseline Diagnostics) *checkJob {
@@ -82,9 +83,9 @@ func (j *checkJob) stop() {
 	}
 }
 
-func (j *checkJob) fail(message string) {
+func (j *checkJob) fail(err error) {
 	if j.active() {
-		j.phase, j.message = CheckError, message
+		j.phase, j.message, j.err = CheckError, err.Error(), err
 	}
 }
 
@@ -321,7 +322,7 @@ func StartHardwareCheck(c *dongle.Client, options HardwareCheckOptions) (*Hardwa
 		return o.Exchange(pdu)
 	})
 	if err != nil {
-		h.job.fail(err.Error())
+		h.job.fail(err)
 		return nil, h.report(0), err
 	}
 	h.started = o.clock.Now()
@@ -340,20 +341,27 @@ func (h *HardwareCheck) report(elapsed time.Duration) CheckProgress {
 // ended, with the final progress and, only for CheckError, an error. It sends nothing but
 // status reads and, every 2 s while the link is up, one short leased read of the results.
 //
+// A client whose context has ended stops the check as Stop does: the AirPods may still finish.
+//
 // Blocking for one read at most; run it on the device owner goroutine.
 func (h *HardwareCheck) Step(c *dongle.Client) (CheckProgress, bool, error) {
 	elapsed := h.clock.Now().Sub(h.started)
+	if c.Context().Err() != nil {
+		h.job.stop()
+	}
 	if h.stepBegin(elapsed) {
 		status, err := c.Status()
 		switch {
+		case err != nil && c.Context().Err() != nil:
+			h.job.stop()
 		case err != nil && h.options.TolerateLinkLoss:
 			h.job.waiting()
 		case err != nil:
-			h.job.fail(err.Error())
+			h.job.fail(err)
 		case !status.Connected:
 			h.job.waiting()
 		case status.Peer != h.peer:
-			h.job.fail("Different AirPods connected, so this check is no longer being followed.")
+			h.job.fail(errors.New("Different AirPods connected, so this check is no longer being followed."))
 		case status.ControlsReady && !status.MicrophoneActive && elapsed-h.lastRead >= checkPoll:
 			h.lastRead = elapsed
 			h.readResults(c, status, elapsed)
@@ -389,12 +397,19 @@ func (h *HardwareCheck) readResults(c *dongle.Client, status dongle.Status, elap
 	if err == nil {
 		return
 	}
+	// Another client holding the channel says nothing about the check. Look again next time,
+	// within the time limit, as a mode change does.
+	var rejected *dongle.RequestRejected
+	if errors.As(err, &rejected) && rejected.Code == 2 {
+		h.job.waiting()
+		return
+	}
 	// An error across a reconnect is expected. One on a steady link is not.
 	var refusal *Refused
 	now, statusErr := c.Status()
 	steady := statusErr == nil && now.Generation == status.Generation && now.Connected
 	if steady && !errors.As(err, &refusal) {
-		h.job.fail(fmt.Sprintf("Could not read the hardware check result: %v", err))
+		h.job.fail(fmt.Errorf("Could not read the hardware check result: %w", err))
 	}
 }
 
@@ -409,7 +424,7 @@ func (h *HardwareCheck) stepEnd(elapsed time.Duration) (CheckProgress, bool, err
 		return progress, false, nil
 	}
 	if j.phase == CheckError {
-		return progress, true, errors.New(j.message)
+		return progress, true, j.err
 	}
 	return progress, true, nil
 }

@@ -2,6 +2,7 @@ package hearing
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -314,7 +315,7 @@ func TestCheckJobRules(t *testing.T) {
 		t.Errorf("%+v", job)
 	}
 	job.tick(time.Hour)
-	job.fail("late")
+	job.fail(errors.New("late"))
 	job.stop()
 	if job.phase != CheckCompleted || job.message != "" {
 		t.Errorf("a finished job moved: %+v", job)
@@ -382,5 +383,110 @@ func TestCheckStoppedWhileAbsent(t *testing.T) {
 	stop = true
 	if progress, done, err := check.Absent(); !done || err != nil || progress.Phase != CheckStopped {
 		t.Fatalf("%+v %v %v", progress, done, err)
+	}
+}
+
+func startedCheck(t *testing.T, a *sim.HearingAirPods, options HardwareCheckOptions) (*HardwareCheck, *dongle.Client, *sim.Device) {
+	t.Helper()
+	client, dev := rig(t, a)
+	options.BudsInCaseConfirmed = true
+	check, _, err := StartHardwareCheck(client, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return check, client, dev
+}
+
+func TestABusyChannelOnlyDelaysTheCheck(t *testing.T) {
+	a := proThree()
+	check, client, dev := startedCheck(t, a, HardwareCheckOptions{})
+	dev.Update(func(c *sim.Config) { c.Fail = map[byte]byte{leaseKind: 2} })
+	for range 20 {
+		client.Clock().Sleep(checkPoll)
+		progress, done, err := check.Step(client)
+		if done || err != nil || progress.Phase != CheckWaitingResult {
+			t.Fatalf("busy ended the wait: %+v %v %v", progress, done, err)
+		}
+	}
+	dev.Update(func(c *sim.Config) { c.Fail = nil })
+	a.Server.Find(sim.UUIDDiagnostics).Value = sim.DiagnosticRecord(1750009000, 1750009300, 0, 0)
+	client.Clock().Sleep(checkPoll)
+	if progress, done, err := check.Step(client); !done || err != nil || progress.Phase != CheckCompleted {
+		t.Fatalf("%+v %v %v", progress, done, err)
+	}
+}
+
+func TestABusyChannelStillMeetsTheTimeLimit(t *testing.T) {
+	check, client, dev := startedCheck(t, proThree(), HardwareCheckOptions{})
+	dev.Update(func(c *sim.Config) { c.Fail = map[byte]byte{leaseKind: 2} })
+	for range int(checkWait/checkPoll) + 2 {
+		client.Clock().Sleep(checkPoll)
+		if progress, done, err := check.Step(client); done {
+			if err != nil || progress.Phase != CheckTimedOut {
+				t.Fatalf("%+v %v", progress, err)
+			}
+			return
+		}
+	}
+	t.Fatal("never ended")
+}
+
+func TestOtherReadFailuresEndTheCheckWithTheirCause(t *testing.T) {
+	check, client, dev := startedCheck(t, proThree(), HardwareCheckOptions{})
+	dev.Update(func(c *sim.Config) { c.Fail = map[byte]byte{leaseKind: 5} })
+	client.Clock().Sleep(checkPoll)
+	progress, done, err := check.Step(client)
+	if !done || progress.Phase != CheckError {
+		t.Fatalf("%+v %v %v", progress, done, err)
+	}
+	var rejected *dongle.RequestRejected
+	if !errors.As(err, &rejected) || rejected.Code != 5 {
+		t.Errorf("the cause was lost: %#v", err)
+	}
+	if want := "Could not read the hardware check result: RPC failure: device timeout"; err.Error() != want || progress.Message != want {
+		t.Errorf("err %q, message %q", err, progress.Message)
+	}
+}
+
+func TestAStatusFailureEndsTheCheck(t *testing.T) {
+	check, client, dev := startedCheck(t, proThree(), HardwareCheckOptions{})
+	if err := dev.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, done, err := check.Step(client)
+	if !done || err == nil {
+		t.Fatalf("%v %v", done, err)
+	}
+	if err.Error() != "simulated device is closed" {
+		t.Errorf("err %q", err)
+	}
+}
+
+func TestAnEndedContextStopsTheCheck(t *testing.T) {
+	for _, tolerate := range []bool{false, true} {
+		check, client, _ := startedCheck(t, proThree(), HardwareCheckOptions{TolerateLinkLoss: tolerate})
+		progress, done, err := check.Step(client.WithContext(endedContext()))
+		if !done || err != nil || progress.Phase != CheckStopped {
+			t.Errorf("tolerate %v: %+v %v %v", tolerate, progress, done, err)
+		}
+	}
+}
+
+func TestRunHardwareCheckEndsWithItsContext(t *testing.T) {
+	client, _ := rig(t, proThree())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ticks := 0
+	progress, err := RunHardwareCheck(client.WithContext(ctx), HardwareCheckOptions{
+		BudsInCaseConfirmed: true,
+		Stop: func() bool {
+			if ticks++; ticks == 3 {
+				cancel()
+			}
+			return false
+		},
+	})
+	if err != nil || progress.Phase != CheckStopped {
+		t.Fatalf("%+v %v", progress, err)
 	}
 }
