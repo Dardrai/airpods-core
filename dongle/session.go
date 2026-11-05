@@ -1,6 +1,7 @@
 package dongle
 
 import (
+	"context"
 	"errors"
 	"time"
 )
@@ -39,7 +40,7 @@ func (c *Client) OpenSession() (*Session, error) {
 	}
 	return &Session{
 		client:  c,
-		request: transaction{dev: c.dev, clock: c.clock, rules: sessionRules, generation: status.Generation, pinned: true},
+		request: transaction{dev: c.dev, clock: c.clock, ctx: c.ctx, rules: sessionRules, generation: status.Generation, pinned: true},
 		leaseOK: status.Has(CapLease),
 	}, nil
 }
@@ -80,8 +81,10 @@ func (s *Session) ensureLease(raw bool) error {
 }
 
 func (s *Session) do(op byte, payload []byte) ([]byte, error) {
-	s.client.mu.Lock()
-	defer s.client.mu.Unlock()
+	if err := s.client.acquire(); err != nil {
+		return nil, NotSent(err)
+	}
+	defer s.client.release()
 	if err := s.ensureLease(op == opExchange || op == opSendAACP); err != nil {
 		return nil, NotSent(err) // Lease traffic only; this request has not gone out.
 	}
@@ -91,8 +94,10 @@ func (s *Session) do(op byte, payload []byte) ([]byte, error) {
 // AcquireLease takes the lease up front, so kept reports read now belong to the same
 // lease as the writes and cleanup that follow them.
 func (s *Session) AcquireLease() error {
-	s.client.mu.Lock()
-	defer s.client.mu.Unlock()
+	if err := s.client.acquire(); err != nil {
+		return err
+	}
+	defer s.client.release()
 	return s.ensureLease(true)
 }
 
@@ -121,10 +126,12 @@ func (s *Session) Cached(slot byte) (*Cached, error) {
 	return DecodeCached(reply)
 }
 
-// Close cancels anything unfinished and gives the lease back.
+// Close cancels anything unfinished and gives the lease back, even after the session's context
+// has ended: it is the cleanup that lets the next user of the dongle in.
 func (s *Session) Close() {
-	s.client.mu.Lock()
-	defer s.client.mu.Unlock()
+	s.client.turn <- struct{}{}
+	defer s.client.release()
+	s.request.ctx = context.Background()
 	s.request.cancel()
 	token := s.token
 	s.token, s.failed = 0, true

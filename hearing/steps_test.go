@@ -1,6 +1,7 @@
 package hearing
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -421,4 +422,62 @@ func TestOperationPastItsLimitIsErrDeadline(t *testing.T) {
 	if err := o.check(); !errors.Is(err, ErrDeadline) {
 		t.Errorf("err %v", err)
 	}
+}
+
+func endedContext() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
+}
+
+func TestAnEndedContextEndsAModeChangeAsUnconfirmed(t *testing.T) {
+	a := proThree()
+	a.Silent = true
+	client, _ := rig(t, a)
+	modes := new(Modes)
+	change, err := modes.StartSet(client, HearingAid, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sent := len(a.Received)
+	_, err = change.wait(client.WithContext(endedContext()))
+	var unconfirmed *ModeUnconfirmed
+	if !errors.As(err, &unconfirmed) || unconfirmed.Recovery == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("err %v", err)
+	}
+	if len(a.Received) != sent {
+		t.Error("sent something while stopping")
+	}
+	if _, err := modes.Set(client.WithContext(endedContext()), HearingAid, false); !errors.Is(err, context.Canceled) {
+		t.Fatalf("starting with an ended context: %v", err)
+	}
+}
+
+func TestAnEndedContextEndsAProfileApply(t *testing.T) {
+	a := proThree()
+	client, dev := rig(t, a)
+	modes := new(Modes)
+	expected := readBaseline(t, client, modes)
+	requested := expected
+	requested.OwnVoice = 0.25
+	apply, err := modes.StartApplyProfile(client, expected, requested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ended := client.WithContext(endedContext())
+	for range 10 {
+		if _, done, err := apply.Step(ended); done {
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("err %v", err)
+			}
+			if a.Server.Writes != 0 {
+				t.Error("written after the context ended")
+			}
+			if dev.LeaseHeld() {
+				t.Error("left holding the lease")
+			}
+			return
+		}
+	}
+	t.Fatal("kept going")
 }

@@ -306,5 +306,11 @@ func (c *Client) leaseAction(action byte, token uint32) error {
 	return nil
 }
 
-// Clock returns the client's time source, for waits that belong to one operation.
-func (c *Client) Clock() Clock { return c.clock }
+// Clock returns the client's time source, for waits that belong to one operation. On a view with
+// a context, its Sleep ends early when the context does.
+func (c *Client) Clock() Clock {
+	if c.ctx.Done() == nil {
+		return c.clock
+	}
+	return contextClock{c.clock, c.ctx}
+}

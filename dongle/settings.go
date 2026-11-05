@@ -360,7 +360,7 @@ func (s *SettingsClient) Set(name string, value uint32) (string, error) {
 			Err:     err,
 		}
 	}
-	clock := s.client.clock
+	clock := s.client.Clock()
 	until := clock.Now().Add(settingConfirmWait)
 	for clock.Now().Before(until) {
 		values, err := s.Read()

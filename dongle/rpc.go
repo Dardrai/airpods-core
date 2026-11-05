@@ -1,9 +1,9 @@
 package dongle
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
-	"sync"
 	"time"
 
 	"github.com/Dardrai/airpods-core/hid"
@@ -19,9 +19,44 @@ type realClock struct{}
 
 func (realClock) Now() time.Time        { return time.Now() }
 func (realClock) Sleep(d time.Duration) { time.Sleep(d) }
+func (realClock) SleepContext(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 
 // RealClock is the wall clock.
 var RealClock Clock = realClock{}
+
+// ContextSleeper is an optional addition to a Clock: a sleep a context can cut short. A Clock
+// without it finishes each sleep first, and the context is looked at right afterwards.
+type ContextSleeper interface {
+	SleepContext(ctx context.Context, d time.Duration) error
+}
+
+func sleepContext(ctx context.Context, clock Clock, d time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if sleeper, ok := clock.(ContextSleeper); ok {
+		return sleeper.SleepContext(ctx, d)
+	}
+	clock.Sleep(d)
+	return ctx.Err()
+}
+
+// contextClock is a client's Clock when the client has a context to honour.
+type contextClock struct {
+	Clock
+	ctx context.Context
+}
+
+func (c contextClock) Sleep(d time.Duration) { _ = sleepContext(c.ctx, c.Clock, d) }
 
 const (
 	maxFragment     = 42
@@ -39,27 +74,80 @@ const (
 	codeUnsupported = 7
 )
 
-// Client serialises protocol transactions on one device.
+// Client serialises protocol transactions on one device. Everything derived from it, including
+// the views WithContext returns, shares that serialisation, so it can be used from several
+// goroutines; going to the device directly gives that up.
 type Client struct {
 	dev        hid.Device
 	clock      Clock
-	mu         sync.Mutex
-	controlSeq uint32
+	ctx        context.Context
+	turn       chan struct{} // holds one token while a transaction runs
+	controlSeq *uint32
 }
 
-// NewClient wraps an open device. The caller keeps ownership of closing it.
-func NewClient(dev hid.Device) *Client { return &Client{dev: dev, clock: RealClock} }
+// NewClient wraps an open device. The caller keeps ownership of the device, and closes it
+// either directly or through Client.Close.
+func NewClient(dev hid.Device) *Client {
+	return &Client{dev: dev, clock: RealClock, ctx: context.Background(), turn: make(chan struct{}, 1), controlSeq: new(uint32)}
+}
 
-// SetClock replaces the time source; call it before using the client.
+// SetClock replaces the time source; call it before using the client or deriving from it.
 func (c *Client) SetClock(clock Clock) { c.clock = clock }
 
-// Device returns the wrapped device.
+// Device returns the wrapped device. Traffic sent straight to it is not serialised with
+// the client's; it is there for what the Device interface offers beyond the protocol.
 func (c *Client) Device() hid.Device { return c.dev }
+
+// WithContext returns a view of the client that gives up when ctx ends, sharing its device and
+// its turn. Calls on the view, and sessions and settings clients derived from it, then fail
+// with ctx.Err() in their chain, while waiting for their turn, between polls and during
+// sleeps on Clock.
+//
+// What it does not do: a single HID transfer always runs to completion, which is bounded by the
+// system (see hid.Device). A request stopped halfway is still cancelled on the dongle first,
+// taking up to a second, and Session.Close still gives the lease back. A write stopped after it
+// may have gone out is reported as Unconfirmed, like any other uncertain outcome.
+func (c *Client) WithContext(ctx context.Context) *Client {
+	if ctx == nil {
+		panic("dongle: nil context")
+	}
+	view := *c
+	view.ctx = ctx
+	return &view
+}
+
+// Context returns the context of this view, context.Background() unless WithContext set one.
+func (c *Client) Context() context.Context { return c.ctx }
+
+// Close waits for the transaction under way, then closes the device. It is for callers that
+// hand the device over to the client; a call under way ends sooner if its context does.
+func (c *Client) Close() error {
+	c.turn <- struct{}{}
+	defer c.release()
+	return c.dev.Close()
+}
+
+// acquire waits for this client's turn on the device, or for its context to end.
+func (c *Client) acquire() error {
+	if err := c.ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case c.turn <- struct{}{}:
+		return nil
+	case <-c.ctx.Done():
+		return c.ctx.Err()
+	}
+}
+
+func (c *Client) release() { <-c.turn }
 
 // Status reads and decodes report 2.
 func (c *Client) Status() (Status, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	if err := c.acquire(); err != nil {
+		return Status{}, err
+	}
+	defer c.release()
 	raw, err := c.dev.Get(2)
 	if err != nil {
 		return Status{}, err
@@ -75,9 +163,11 @@ func (c *Client) TypedRequest(payload []byte, generation *uint32) ([]byte, error
 }
 
 func (c *Client) typedRequest(op byte, payload []byte, generation *uint32) ([]byte, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	t := &transaction{dev: c.dev, clock: c.clock, rules: typedRules}
+	if err := c.acquire(); err != nil {
+		return nil, NotSent(err)
+	}
+	defer c.release()
+	t := &transaction{dev: c.dev, clock: c.clock, ctx: c.ctx, rules: typedRules}
 	if generation != nil {
 		t.generation, t.pinned = *generation, true
 	}
@@ -128,6 +218,7 @@ const generationChangedText = "Pico session changed; run the command again"
 type transaction struct {
 	dev   hid.Device
 	clock Clock
+	ctx   context.Context
 	rules transactionRules
 
 	generation uint32
@@ -149,6 +240,14 @@ func (t *transaction) checkGeneration(message string) error {
 }
 
 func (t *transaction) send(op byte, total, offset int, data []byte) error {
+	if err := t.ctx.Err(); err != nil {
+		return err
+	}
+	return t.sendNow(op, total, offset, data)
+}
+
+// sendNow is send without regard to the context, for the cancel that follows it ending.
+func (t *transaction) sendNow(op byte, total, offset int, data []byte) error {
 	if err := t.checkGeneration(t.rules.changedText); err != nil {
 		return err
 	}
@@ -177,6 +276,9 @@ func (t *transaction) wait(limit time.Duration, accept func(report [hid.ReportSi
 	le := binary.LittleEndian
 	deadline := t.clock.Now().Add(limit)
 	for t.clock.Now().Before(deadline) {
+		if err := t.ctx.Err(); err != nil {
+			return none, err
+		}
 		if err := t.checkGeneration(t.rules.changedText); err != nil {
 			return none, err
 		}
@@ -197,7 +299,7 @@ func (t *transaction) wait(limit time.Duration, accept func(report [hid.ReportSi
 				return report, nil
 			}
 		}
-		t.clock.Sleep(rpcPoll)
+		_ = sleepContext(t.ctx, t.clock, rpcPoll) // An ended context is seen at the top.
 	}
 	return none, ErrRPCTimeout
 }
@@ -212,6 +314,9 @@ func (t *transaction) run(op byte, payload []byte) ([]byte, error) {
 		return nil, NotSent(errors.New("The previous dongle request has not finished cancelling."))
 	}
 	t.attempted = false
+	if err := t.ctx.Err(); err != nil {
+		return nil, NotSent(err)
+	}
 	current, err := currentGeneration(t.dev)
 	if err != nil {
 		return nil, NotSent(err)
@@ -306,12 +411,13 @@ func (t *transaction) exchange(op byte, payload []byte) ([]byte, error) {
 }
 
 // cancel asks the dongle to drop the request and waits for its receipt, since later traffic
-// must not overtake it. A request that never reached a Set has nothing to drop.
+// must not overtake it. A request that never reached a Set has nothing to drop. It runs whatever
+// the context says, within cancelWait, so a stopped request does not leave the channel busy.
 func (t *transaction) cancel() {
 	if !t.attempted {
 		t.active = false
 	}
-	if !t.active || t.send(opCancel, 0, 0, nil) != nil {
+	if !t.active || t.sendNow(opCancel, 0, 0, nil) != nil {
 		return
 	}
 	le := binary.LittleEndian

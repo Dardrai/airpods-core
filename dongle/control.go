@@ -81,8 +81,10 @@ func validateCommand(status Status, opcode, arg byte) error {
 // is tied to the sequence, not the generation, because pairing changes generation.
 // It returns ControlRejected when refused and Unconfirmed once the outcome is unknown.
 func (c *Client) Command(opcode, arg byte) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	if err := c.acquire(); err != nil {
+		return err
+	}
+	defer c.release()
 	raw, err := c.dev.Get(2)
 	if err != nil {
 		return err
@@ -93,14 +95,14 @@ func (c *Client) Command(opcode, arg byte) error {
 	}
 	// Monotonic even if an earlier command never produced a receipt.
 	sequence := status.ReceiptSequence
-	if c.controlSeq-sequence < 1<<31 {
-		sequence = c.controlSeq
+	if *c.controlSeq-sequence < 1<<31 {
+		sequence = *c.controlSeq
 	}
 	sequence++
 	if sequence == 0 {
 		sequence = 1
 	}
-	c.controlSeq = sequence
+	*c.controlSeq = sequence
 
 	var data [hid.ReportSize]byte
 	header := hid.Header(2)
@@ -124,6 +126,9 @@ func (c *Client) Command(opcode, arg byte) error {
 	}
 	deadline := c.clock.Now().Add(controlWait)
 	for c.clock.Now().Before(deadline) {
+		if err := c.ctx.Err(); err != nil {
+			return unconfirmed(err)
+		}
 		raw, err := c.dev.Get(2)
 		if err != nil {
 			return unconfirmed(err)
@@ -135,7 +140,7 @@ func (c *Client) Command(opcode, arg byte) error {
 			}
 			return &ControlRejected{Opcode: opcode, Result: report.ReceiptResult}
 		}
-		c.clock.Sleep(controlPoll)
+		_ = sleepContext(c.ctx, c.clock, controlPoll) // An ended context is seen at the top.
 	}
 	return &Unconfirmed{Message: name + ": sent, but no receipt from the dongle. It may have applied; check status before retrying."}
 }
