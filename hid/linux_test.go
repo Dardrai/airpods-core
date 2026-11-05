@@ -115,6 +115,45 @@ func TestOSErrorFormat(t *testing.T) {
 	}
 }
 
+func TestOSErrorKeepsIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		errno syscall.Errno
+		text  string
+		kind  error
+	}{
+		{syscall.ENODEV, "[Errno 19] No such device", ErrDisconnected},
+		{syscall.ESHUTDOWN, "[Errno 108] Cannot send after transport endpoint shutdown", ErrDisconnected},
+		{syscall.ENXIO, "[Errno 6] No such device or address", ErrDisconnected},
+		{syscall.ETIMEDOUT, "[Errno 110] Connection timed out", ErrTimeout},
+		{syscall.EIO, "[Errno 5] Input/output error", nil},
+		{syscall.EACCES, "[Errno 13] Permission denied", nil},
+	} {
+		err := osError(tc.errno)
+		if err.Error() != tc.text {
+			t.Errorf("%d: text %q", tc.errno, err)
+		}
+		if !errors.Is(err, tc.errno) {
+			t.Errorf("%d: lost the errno", tc.errno)
+		}
+		var errno syscall.Errno
+		if !errors.As(err, &errno) || errno != tc.errno {
+			t.Errorf("%d: errors.As found %d", tc.errno, errno)
+		}
+		for _, kind := range []error{ErrDisconnected, ErrTimeout} {
+			if errors.Is(err, kind) != (kind == tc.kind) {
+				t.Errorf("%d: errors.Is(%v) = %v", tc.errno, kind, errors.Is(err, kind))
+			}
+		}
+	}
+	if !errors.Is(osError(syscall.EACCES), os.ErrPermission) {
+		t.Error("EACCES should still match os.ErrPermission")
+	}
+	plain := errors.New("plain")
+	if osError(plain) != plain {
+		t.Error("an error without an errno passes through")
+	}
+}
+
 func TestUeventIDs(t *testing.T) {
 	vid, pid, ok := ueventIDs("DRIVER=hid-generic\nHID_ID=0003:0000CAFE:00004015\nHID_NAME=x\n")
 	if !ok || vid != 0xcafe || pid != 0x4015 {

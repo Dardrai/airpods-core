@@ -4,8 +4,9 @@ import "errors"
 
 // Errors from one overlapped feature transfer.
 var (
-	ErrFeatureTimeout = errors.New("USB feature transfer exceeded 400 ms")
-	errIncomplete     = errors.New("Incomplete USB feature report")
+	// ErrFeatureTimeout is a Windows transfer exceeding its bound; it matches ErrTimeout.
+	ErrFeatureTimeout error = &wrappedError{text: "USB feature transfer exceeded 400 ms", causes: []error{ErrTimeout}}
+	errIncomplete           = errors.New("Incomplete USB feature report")
 )
 
 // featureWaitMillis bounds one overlapped transfer.

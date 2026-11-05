@@ -28,6 +28,34 @@ type Device interface {
 // version is not the one this tool speaks.
 var ErrUnsupportedReport = errors.New("Unsupported HID report identity/version")
 
+// Conditions that apply on every platform. errors.Is finds them in the errors of Get, Set
+// and Open, which keep their own text and still wrap the OS error underneath.
+var (
+	// ErrDisconnected means the device went away; a new Open is the only way back.
+	ErrDisconnected = errors.New("HID device disconnected")
+	// ErrTimeout means one transfer ran out of time. It may still have reached the device.
+	ErrTimeout = errors.New("HID transfer timed out")
+)
+
+// wrappedError shows its own text and wraps the OS error and the condition behind it.
+type wrappedError struct {
+	text   string
+	causes []error
+}
+
+func (e *wrappedError) Error() string   { return e.text }
+func (e *wrappedError) Unwrap() []error { return e.causes }
+
+// systemError gives an OS error the text the apps show, keeping its identity for errors.Is
+// and adding kind, the cross-platform condition, when there is one.
+func systemError(text string, cause, kind error) error {
+	causes := []error{cause}
+	if kind != nil {
+		causes = append(causes, kind)
+	}
+	return &wrappedError{text: text, causes: causes}
+}
+
 // Header returns the seven identity bytes of a report.
 func Header(report byte) [7]byte {
 	return [7]byte{report, 'A', 'P', 'D', 'G', 1, ReportSize}

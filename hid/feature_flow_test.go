@@ -63,6 +63,9 @@ func TestRunOverlapped(t *testing.T) {
 			}
 		})
 	}
+	if !errors.Is(ErrFeatureTimeout, ErrTimeout) {
+		t.Fatal("ErrFeatureTimeout must match ErrTimeout")
+	}
 	if ErrFeatureTimeout.Error() != "USB feature transfer exceeded 400 ms" || errIncomplete.Error() != "Incomplete USB feature report" {
 		t.Fatal("error text changed")
 	}

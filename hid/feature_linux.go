@@ -31,12 +31,23 @@ func ioctl(fd int, request uintptr, arg unsafe.Pointer) error {
 	return nil
 }
 
-// osError formats an errno as "[Errno N] Text".
+// errnoKind names the cross-platform condition of an errno, if it has one.
+func errnoKind(errno syscall.Errno) error {
+	switch errno {
+	case syscall.ENODEV, syscall.ENXIO, syscall.ESHUTDOWN:
+		return ErrDisconnected
+	case syscall.ETIMEDOUT, syscall.ETIME:
+		return ErrTimeout
+	}
+	return nil
+}
+
+// osError formats an errno as "[Errno N] Text"; errors.Is still finds the errno.
 func osError(err error) error {
 	var errno syscall.Errno
 	if errors.As(err, &errno) {
 		text := errno.Error()
-		return fmt.Errorf("[Errno %d] %s%s", int(errno), strings.ToUpper(text[:1]), text[1:])
+		return systemError(fmt.Sprintf("[Errno %d] %s%s", int(errno), strings.ToUpper(text[:1]), text[1:]), errno, errnoKind(errno))
 	}
 	return err
 }

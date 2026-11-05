@@ -49,11 +49,24 @@ type hiddAttributes struct {
 	version uint16
 }
 
-// winError formats an OS error as "[WinError N] text".
+// winErrorKind names the cross-platform condition of a Windows error, if it has one.
+func winErrorKind(code windows.Errno) error {
+	switch code {
+	case windows.ERROR_FILE_NOT_FOUND, windows.ERROR_PATH_NOT_FOUND, windows.ERROR_DEV_NOT_EXIST,
+		windows.ERROR_GEN_FAILURE, windows.ERROR_NO_SUCH_DEVICE, windows.ERROR_DEVICE_NOT_CONNECTED,
+		windows.ERROR_DEVICE_REMOVED:
+		return ErrDisconnected
+	case windows.ERROR_SEM_TIMEOUT, windows.WAIT_TIMEOUT, windows.ERROR_TIMEOUT:
+		return ErrTimeout
+	}
+	return nil
+}
+
+// winError formats an OS error as "[WinError N] text"; errors.Is still finds the code.
 func winError(err error) error {
 	var code windows.Errno
 	if errors.As(err, &code) {
-		return fmt.Errorf("[WinError %d] %s", uint32(code), code.Error())
+		return systemError(fmt.Sprintf("[WinError %d] %s", uint32(code), code.Error()), code, winErrorKind(code))
 	}
 	return err
 }
