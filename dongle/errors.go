@@ -60,8 +60,11 @@ var (
 	ErrNotReady = errors.New("AirPods settings connection is not ready")
 	// ErrMicrophoneActive means settings cannot change while the microphone is in use.
 	ErrMicrophoneActive = errors.New("Stop microphone use before changing AirPods settings")
-	// ErrNotSent means a request failed before anything was handed to the device, so it
-	// cannot have applied. Any failure not matching it may have reached the dongle.
+	// ErrNotSent means a request failed before any of it was handed to the device, or the
+	// device refused its first report as closed, so that request cannot have applied. It
+	// speaks for that one request only: status reads, lease traffic, the cancel of a stale
+	// request and earlier requests of the same call may have gone out. A failure without it
+	// is no proof of the opposite: some come from checks made before anything was sent.
 	ErrNotSent = errors.New("The request was not sent")
 )
 

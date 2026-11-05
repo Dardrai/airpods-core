@@ -156,8 +156,8 @@ func (c *Client) Status() (Status, error) {
 }
 
 // TypedRequest runs one bounded report-3 request and never retries an uncertain
-// write. A non-nil generation pins the request to that connection generation. A failure
-// matching ErrNotSent cannot have reached the dongle.
+// write. A non-nil generation pins the request to that connection generation. With a failure
+// matching ErrNotSent the request cannot have reached the dongle.
 func (c *Client) TypedRequest(payload []byte, generation *uint32) ([]byte, error) {
 	return c.typedRequest(opFeature, payload, generation)
 }
