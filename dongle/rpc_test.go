@@ -450,3 +450,65 @@ func TestSetFailureStillCancels(t *testing.T) {
 		t.Errorf("sent %d cancels", device.ops[5])
 	}
 }
+
+// closedDevice fails every Set as a device does after Close, counting them.
+type closedDevice struct {
+	*sim.Device
+	sets int
+}
+
+func (d *closedDevice) Set([hid.ReportSize]byte) error {
+	d.sets++
+	return hid.ErrClosed
+}
+
+func TestASetOnAClosedDeviceWasNotSent(t *testing.T) {
+	device := &closedDevice{Device: sim.New(sim.Default())}
+	client := NewClient(device)
+	client.SetClock(sim.NewVirtualClock())
+	_, err := client.TypedRequest([]byte{9}, nil)
+	if !errors.Is(err, hid.ErrClosed) || !errors.Is(err, ErrNotSent) {
+		t.Fatalf("err = %v", err)
+	}
+	if device.sets != 1 {
+		t.Errorf("%d Sets, so a cancel followed a request that never left", device.sets)
+	}
+	settings, err := client.SettingsClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, write := range map[string]func(string, uint32) (string, error){"set": settings.Set, "send": settings.Send} {
+		_, err := write("mode", 1)
+		var unconfirmed *Unconfirmed
+		if errors.As(err, &unconfirmed) {
+			t.Errorf("%s: wrapped as Unconfirmed: %v", name, err)
+		}
+		if !errors.Is(err, hid.ErrClosed) || !errors.Is(err, ErrNotSent) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+// A Set that fails on a closed device after an earlier one went out is no proof of anything.
+func TestALaterSetOnAClosedDeviceMayHaveApplied(t *testing.T) {
+	device := &closingDevice{Device: sim.New(sim.Default())}
+	client := NewClient(device)
+	client.SetClock(sim.NewVirtualClock())
+	_, err := client.TypedRequest([]byte{9}, nil)
+	if !errors.Is(err, hid.ErrClosed) || errors.Is(err, ErrNotSent) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// closingDevice passes the first Set on and fails the rest as a closed device does.
+type closingDevice struct {
+	*sim.Device
+	sets int
+}
+
+func (d *closingDevice) Set(data [hid.ReportSize]byte) error {
+	if d.sets++; d.sets > 1 {
+		return hid.ErrClosed
+	}
+	return d.Device.Set(data)
+}

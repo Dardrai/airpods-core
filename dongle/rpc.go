@@ -225,7 +225,7 @@ type transaction struct {
 	pinned     bool // the generation is fixed; otherwise the request adopts the current one
 	sequence   uint32
 	active     bool // the dongle may still hold this request
-	attempted  bool // a Set of this request was tried, so it may have reached the dongle
+	attempted  bool // a Set of this request went to the system, so it may have reached the dongle
 }
 
 func (t *transaction) checkGeneration(message string) error {
@@ -246,8 +246,12 @@ func (t *transaction) send(op byte, total, offset int, data []byte) error {
 	if err := t.checkGeneration(t.rules.changedText); err != nil {
 		return err
 	}
-	t.attempted = true
-	return t.dev.Set(t.report(op, total, offset, data))
+	err := t.dev.Set(t.report(op, total, offset, data))
+	// A closed device sent nothing; any other outcome may have reached the dongle.
+	if !errors.Is(err, hid.ErrClosed) {
+		t.attempted = true
+	}
+	return err
 }
 
 func (t *transaction) report(op byte, total, offset int, data []byte) [hid.ReportSize]byte {
@@ -301,7 +305,7 @@ func (t *transaction) wait(limit time.Duration, accept func(report [hid.ReportSi
 
 // run performs one request. A channel another client is using is a RequestRejected with code 2;
 // a request left on it by an earlier generation is cancelled first.
-// A failure from before the first Set matches ErrNotSent.
+// A failure from before the first Set matches ErrNotSent, as does that Set failing on a closed device.
 func (t *transaction) run(op byte, payload []byte) ([]byte, error) {
 	if len(payload) == 0 || len(payload) > t.rules.maxPayload {
 		return nil, NotSent(errors.New(t.rules.sizeText))
