@@ -1,0 +1,2 @@
+# hid.UdevRules embeds this file, and apps compare their packaged copy with it byte for byte.
+*.rules text eol=lf
