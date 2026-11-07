@@ -78,7 +78,7 @@ func requestGate(status dongle.Status) error {
 	switch {
 	case !status.Connected || !status.ControlsReady:
 		return &Refused{"Connect the dongle's AirPods before reading or changing hearing data.", dongle.ErrNotReady}
-	case !status.Has(dongle.CapRPC):
+	case !status.Has(dongle.CapRawTransport):
 		return refuse("Update the dongle firmware before reading or changing hearing data.")
 	case status.MicrophoneActive:
 		return &Refused{"Stop recording and wait for the microphone to recover before reading or changing hearing data.", dongle.ErrMicrophoneActive}

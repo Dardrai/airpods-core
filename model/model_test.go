@@ -141,3 +141,31 @@ func TestHeadphoneOnlyOnMax(t *testing.T) {
 		t.Error("headphone")
 	}
 }
+
+func TestNeedsAllowOffResend(t *testing.T) {
+	pro3 := view("A3063", "9A348", map[byte]uint32{0x0d: 2})
+	for _, tc := range []struct {
+		name    string
+		v       View
+		control byte
+		value   uint32
+		sent    bool
+		want    bool
+	}{
+		{"mode off", pro3, ControlMode, 1, false, true},
+		{"cycle with off", pro3, ControlCycle, 7, false, true},
+		{"already sent", pro3, ControlMode, 1, true, false},
+		{"mode anc", pro3, ControlMode, 2, false, false},
+		{"cycle without off", pro3, ControlCycle, 6, false, false},
+		{"other control", pro3, 0x28, 1, false, false},
+		{"pro 2 reports it", view("A3048", "9A348", map[byte]uint32{0x0d: 2, 0x34: 1}), ControlMode, 1, false, false},
+		{"silent model reported anyway", view("A3063", "9A348", map[byte]uint32{0x34: 1}), ControlMode, 1, false, false},
+		{"mode already off", view("A3063", "9A348", map[byte]uint32{0x0d: 1}), ControlCycle, 3, false, false},
+		{"old firmware", view("A3063", "6A321", map[byte]uint32{0x0d: 2}), ControlMode, 1, false, false},
+		{"unidentified", View{}, ControlMode, 1, false, false},
+	} {
+		if got := tc.v.NeedsAllowOffResend(tc.control, tc.value, tc.sent); got != tc.want {
+			t.Errorf("%s: %v", tc.name, got)
+		}
+	}
+}

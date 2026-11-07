@@ -2,6 +2,7 @@ package dongle
 
 import (
 	"encoding/binary"
+	"strings"
 	"testing"
 
 	"github.com/Dardrai/airpods-core/hid"
@@ -48,7 +49,7 @@ func TestDecodeStatus(t *testing.T) {
 	if s.ReceiptSequence != 44 || s.ReceiptResult != 2 || s.ReceiptOpcode != 4 {
 		t.Errorf("receipt: %+v", s)
 	}
-	if s.Capabilities != 0x18 || !s.Has(CapSettings) || !s.Has(CapRPC) || s.Has(CapLease) || s.PresentMask != 7 || s.CaseSourceMask != 6 {
+	if s.Capabilities != 0x18 || !s.Has(CapTypedRPC) || !s.Has(CapRawTransport) || s.Has(CapLease) || s.PresentMask != 7 || s.CaseSourceMask != 6 {
 		t.Errorf("capabilities: %+v", s)
 	}
 }
@@ -63,5 +64,22 @@ func TestBatteryAndCodecText(t *testing.T) {
 		if got := (Status{Codec: codec}).CodecName(); got != want {
 			t.Errorf("codec %d = %q", codec, got)
 		}
+	}
+}
+
+func TestCapabilityNames(t *testing.T) {
+	got := strings.Join(CapabilityNames(0x3ff), ",")
+	want := "control,listening,pair-phone,raw-transport,typed-rpc,lease,per-component,host-volume,runtime-bootsel,routing"
+	if got != want {
+		t.Errorf("got %s", got)
+	}
+	if got := strings.Join(CapabilityNames(CapTypedRPC|CapRouting|0x8000), ","); got != "typed-rpc,routing,0x8000" {
+		t.Errorf("got %s", got)
+	}
+	if CapabilityNames(0) != nil {
+		t.Error("names for no bits")
+	}
+	if CapRawTransport != 0x08 || CapTypedRPC != 0x10 || CapHostVolume != 0x80 || CapRuntimeBootsel != 0x100 || CapRouting != 0x200 {
+		t.Error("bit values moved")
 	}
 }

@@ -42,8 +42,8 @@ func opcodeName(opcode byte) string {
 	return fmt.Sprintf("opcode %d", opcode)
 }
 
-// validateCommand applies the local precondition checks to known opcodes.
-// Opcodes above 4 pass through unchecked so a later backend can send a new one.
+// validateCommand applies the local precondition checks to known opcodes. Opcodes
+// above 4 pass through unchecked; current firmware answers them as malformed.
 func validateCommand(status Status, opcode, arg byte) error {
 	reject := func(result byte) error { return &ControlRejected{Opcode: opcode, Result: result} }
 	var capability uint16
@@ -139,6 +139,10 @@ func (c *Client) Command(opcode, arg byte) error {
 			return unconfirmed(err)
 		}
 		report := DecodeStatus(raw)
+		// The dongle records opcode 0 for an opcode it does not know, with result 6.
+		if report.ReceiptSequence == sequence && report.ReceiptOpcode == 0 && report.ReceiptResult == ResultMalformed {
+			return &ControlRejected{Opcode: opcode, Result: ResultMalformed}
+		}
 		if report.ReceiptSequence == sequence && report.ReceiptOpcode == opcode && report.ReceiptResult != 0 {
 			if report.ReceiptResult == ResultOK {
 				return nil
@@ -150,7 +154,8 @@ func (c *Client) Command(opcode, arg byte) error {
 	return &Unconfirmed{Message: name + ": sent, but no receipt from the dongle. It may have applied; check status before retrying."}
 }
 
-// Reconnect asks the dongle to reconnect to its AirPods (opcode 1).
+// Reconnect asks the dongle to reconnect to its AirPods (opcode 1). Since firmware 0.1.59
+// this is the same bounded takeover as a button press, and it ends a routing release.
 func (c *Client) Reconnect() error { return c.Command(OpReconnect, 0) }
 
 // Pair puts the dongle in AirPods pairing (opcode 2); refused while audio is in use.

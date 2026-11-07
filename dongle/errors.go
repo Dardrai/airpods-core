@@ -17,10 +17,15 @@ type Unconfirmed struct {
 func (e *Unconfirmed) Error() string { return e.Message }
 func (e *Unconfirmed) Unwrap() error { return sent(e.Err) }
 
-// Unsupported means the device refused a request as unsupported (phase 4, code 7).
-type Unsupported struct{ Message string }
+// Unsupported means the device refused a request as unsupported (phase 4, code 7). Err,
+// when set, is a condition the refusal also matches, such as ErrNotReady.
+type Unsupported struct {
+	Message string
+	Err     error
+}
 
 func (e *Unsupported) Error() string { return e.Message }
+func (e *Unsupported) Unwrap() error { return e.Err }
 
 // RequestRejected is a phase 4 failure of a typed request, or a busy channel.
 type RequestRejected struct{ Code byte }
@@ -131,7 +136,7 @@ func (e *ControlRejected) Error() string {
 	message := "malformed"
 	switch e.Result {
 	case ResultBusy:
-		message = "busy; stop USB audio, microphone and phone use first"
+		message = "busy; another companion request or settings session is running, or USB audio, the microphone or a phone is in use"
 	case ResultStale:
 		message = "stale session"
 	case ResultUnsupported:

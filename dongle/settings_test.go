@@ -169,7 +169,7 @@ func TestErrorTextGolden(t *testing.T) {
 			t.Errorf("code %s: %q, want %q", code, got, want)
 		}
 	}
-	if got := (&Unsupported{golden.Unsupported}).Error(); got != golden.Unsupported {
+	if got := (&Unsupported{Message: golden.Unsupported}).Error(); got != golden.Unsupported {
 		t.Errorf("unsupported: %q", got)
 	}
 }

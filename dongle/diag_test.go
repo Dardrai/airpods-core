@@ -160,3 +160,23 @@ func TestSampleUnsupportedFlags(t *testing.T) {
 		t.Fatalf("inspect must propagate: %v", err)
 	}
 }
+
+func TestSampleRunsAgainstTheSimulator(t *testing.T) {
+	client, _ := newClient(sim.Default())
+	sample, err := client.Sample(SampleOptions{Trace: true, Inspect: true, Phone: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"trace", "inspect", "phone"} {
+		if _, ok := sample.Get(key); !ok {
+			t.Errorf("no %s in %s", key, sample)
+		}
+	}
+	radio, err := client.Sample(SampleOptions{Radio: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := radio.Get("radio"); !ok {
+		t.Errorf("no radio in %s", radio)
+	}
+}

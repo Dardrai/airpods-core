@@ -73,7 +73,7 @@ func TestLeaseLifetime(t *testing.T) {
 	if _, err := session.Exchange([]byte{0x0a, 1, 0}); err != nil {
 		t.Fatal(err)
 	}
-	if err := session.SendAAP([]byte{4, 0, 4, 0}); err != nil {
+	if err := session.SendAAP([]byte{4, 0, 4, 0, 0x0f, 0, 0xff, 0xff, 0xff, 0xff}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := session.Cached(SlotMetadata); err != nil {

@@ -9,16 +9,39 @@ import (
 	"github.com/Dardrai/airpods-core/hid"
 )
 
-// Capability bits of Status.Capabilities.
+// Capability bits of Status.Capabilities, as the firmware's USB control document names them.
 const (
-	CapControl      uint16 = 0x01 // opcodes 1 and 2
-	CapListening    uint16 = 0x02 // opcode 3
-	CapPairPhone    uint16 = 0x04 // opcode 4
-	CapRPC          uint16 = 0x08
-	CapSettings     uint16 = 0x10
-	CapLease        uint16 = 0x20
-	CapPerComponent uint16 = 0x40
+	CapControl        uint16 = 0x001 // opcodes 1 and 2: reconnect and pair
+	CapListening      uint16 = 0x002 // opcode 3, while the AirPods report a listening mode
+	CapPairPhone      uint16 = 0x004 // opcode 4
+	CapRawTransport   uint16 = 0x008 // raw ATT and AAP requests (report 3, ops 1 and 2)
+	CapTypedRPC       uint16 = 0x010 // typed requests (report 3, op 7), settings among them
+	CapLease          uint16 = 0x020 // the settings workflow lease (kind 10)
+	CapPerComponent   uint16 = 0x040 // battery presence and case source masks (bytes 44, 45)
+	CapHostVolume     uint16 = 0x080 // USB host volume authority (kinds 16, 17)
+	CapRuntimeBootsel uint16 = 0x100 // a BOOTSEL request may interrupt active audio
+	CapRouting        uint16 = 0x200 // explicit routing handover (kinds 20, 21)
 )
+
+var capabilityNames = [...]string{"control", "listening", "pair-phone", "raw-transport", "typed-rpc",
+	"lease", "per-component", "host-volume", "runtime-bootsel", "routing"}
+
+// CapabilityNames names every bit set in capabilities, lowest first. A bit without a
+// name is shown as its hex value.
+func CapabilityNames(capabilities uint16) []string {
+	var names []string
+	for bit := range 16 {
+		if capabilities&(1<<bit) == 0 {
+			continue
+		}
+		if bit < len(capabilityNames) {
+			names = append(names, capabilityNames[bit])
+		} else {
+			names = append(names, fmt.Sprintf("0x%x", 1<<bit))
+		}
+	}
+	return names
+}
 
 // BatteryUnknown is the raw battery value the dongle reports for "no reading".
 const BatteryUnknown = 255

@@ -154,3 +154,61 @@ func (a *HearingAirPods) onAAP(pdu []byte) {
 		a.Report(slot, pdu)
 	}
 }
+
+var requestNotifications = []byte{4, 0, 4, 0, 0x0f, 0, 0xff, 0xff, 0xff, 0xff}
+
+// aapAllowed is the dongle's fixed list of AAP packets a host may send: the hearing and
+// assist switches, ANC or transparency, the media assist record, the report request and
+// the host clock. Anything else is refused without being sent.
+func aapAllowed(p []byte) bool {
+	n := len(p)
+	if n < 6 || n > 512 || !bytes.Equal(p[:4], []byte{4, 0, 4, 0}) || p[5] != 0 {
+		return false
+	}
+	switch {
+	case p[4] == 9 && n == 11 && p[9] == 0 && p[10] == 0 && p[6] == 0x2c:
+		return p[7] <= 2 && (p[8] == 1 || p[8] == 2)
+	case p[4] == 9 && n == 11 && p[9] == 0 && p[10] == 0 && p[6] == 0x33:
+		return (p[7] == 1 || p[7] == 2) && p[8] == 0
+	case p[4] == 9 && n == 11 && p[9] == 0 && p[10] == 0 && p[6] == 0x0d:
+		return (p[7] == 2 || p[7] == 3) && p[8] == 0
+	case p[4] == 0x53:
+		return n == 140 && p[6] == 0x84 && p[7] == 0 && p[8] == 2 && p[9] <= 2 &&
+			(p[10] == 1 || p[10] == 2) && (p[11] == 1 || p[11] == 2)
+	case p[4] == 0x0f:
+		return bytes.Equal(p, requestNotifications)
+	case p[4] == 0x1b:
+		return hostClockAllowed(p)
+	}
+	return false
+}
+
+// hostClockAllowed checks a host clock packet: 41 bytes, a 25-byte UTC timestamp
+// "YYYY-MM-DDTHH:MM:SS+00:00" at byte 16, and microseconds below one second.
+func hostClockAllowed(p []byte) bool {
+	le := binary.LittleEndian
+	if len(p) != 41 || le.Uint16(p[14:]) != 25 || le.Uint32(p[10:]) >= 1000000 || string(p[35:41]) != "+00:00" {
+		return false
+	}
+	for i, c := range p[16:35] {
+		switch i {
+		case 4, 7:
+			if c != '-' {
+				return false
+			}
+		case 10:
+			if c != 'T' {
+				return false
+			}
+		case 13, 16:
+			if c != ':' {
+				return false
+			}
+		default:
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}

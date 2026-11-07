@@ -304,9 +304,21 @@ func TestLoudSoundOutcomesAreHonest(t *testing.T) {
 	})
 }
 
+// unlisted lets the sim pass EQ and rename packets on, as a dongle without the fixed
+// packet list would, and keeps every packet the AirPods received.
+func unlisted(t *testing.T, a *sim.HearingAirPods) (*dongle.Client, *sim.Device) {
+	t.Helper()
+	cfg := a.Config()
+	cfg.AnyAAP = true
+	dev := sim.New(cfg)
+	client := dongle.NewClient(dev)
+	client.SetClock(sim.NewVirtualClock())
+	return client, dev
+}
+
 func TestEQGoldenAndNeverConfirmed(t *testing.T) {
 	a := proThree()
-	client, _ := rig(t, a)
+	client, _ := unlisted(t, a)
 	result, err := ExperimentalSendEQ(client, EQ{Mode: 2, Low: 10, Mid: 50, High: 100})
 	if err != nil {
 		t.Fatal(err)
@@ -317,6 +329,20 @@ func TestEQGoldenAndNeverConfirmed(t *testing.T) {
 	}
 	if a.Server.Writes != 0 {
 		t.Error("an AAP send touched an attribute")
+	}
+}
+
+// The dongle's fixed packet list has no EQ or rename packet, so it refuses both with code 6
+// before sending anything. That is a refusal, not a send that may have arrived.
+func TestUnlistedPacketsAreRefusedNotLost(t *testing.T) {
+	a := proThree()
+	client, _ := rig(t, a)
+	_, err := ExperimentalSendEQ(client, EQ{Mode: 1})
+	refused(t, err, "Nothing was sent")
+	_, err = ExperimentalRename(client, "Alex")
+	refused(t, err, "Nothing was sent")
+	if len(a.Received) != 0 {
+		t.Errorf("received %x", a.Received)
 	}
 }
 
@@ -345,7 +371,7 @@ func TestEQGates(t *testing.T) {
 
 func TestRenameGolden(t *testing.T) {
 	a := proThree()
-	client, _ := rig(t, a)
+	client, _ := unlisted(t, a)
 	result, err := ExperimentalRename(client, "Alex")
 	if err != nil || result.Status != StatusSent {
 		t.Fatalf("%+v %v", result, err)
@@ -409,10 +435,14 @@ func TestSendsReportTheDongleRefusing(t *testing.T) {
 func TestLostSendIsUnconfirmed(t *testing.T) {
 	a := proThree()
 	client, dev := rig(t, a)
-	dev.Update(func(c *sim.Config) { c.Fail = map[byte]byte{0: 6} })
+	dev.Update(func(c *sim.Config) { c.Fail = map[byte]byte{0: 5} })
 	_, err := ExperimentalRename(client, "Alex")
 	var u *dongle.Unconfirmed
-	if !errors.As(err, &u) {
+	if !errors.As(err, &u) || !strings.Contains(err.Error(), "may or may not have arrived") {
 		t.Errorf("err %#v", err)
+	}
+	// A transport failure of a listed packet can also be code 6, so that stays uncertain.
+	if err := sendFailure("the packet", &dongle.RequestRejected{Code: 6}); !errors.As(err, &u) {
+		t.Errorf("listed packet: %#v", err)
 	}
 }

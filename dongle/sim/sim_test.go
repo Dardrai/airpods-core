@@ -224,3 +224,84 @@ func TestCancelDropsACommitInProgress(t *testing.T) {
 		}
 	}
 }
+
+func control(opcode byte, sequence uint32) [hid.ReportSize]byte {
+	var data [hid.ReportSize]byte
+	header := hid.Header(2)
+	copy(data[:], header[:])
+	data[7] = opcode
+	binary.LittleEndian.PutUint32(data[8:], 7)
+	copy(data[12:18], []byte{1, 2, 3, 4, 5, 6})
+	binary.LittleEndian.PutUint32(data[18:], sequence)
+	return data
+}
+
+func TestUnknownOpcodeIsMalformedWithOpcodeZero(t *testing.T) {
+	cfg := Default()
+	cfg.ControlResults = map[byte]byte{5: 1}
+	d := New(cfg)
+	d.Set(control(5, 9))
+	status := mustGet(t, d, 2)
+	if binary.LittleEndian.Uint32(status[36:]) != 9 || status[40] != 6 || status[41] != 0 {
+		t.Fatalf("receipt % x", status[36:42])
+	}
+}
+
+func TestDefaultLooksLikeCurrentFirmware(t *testing.T) {
+	status := mustGet(t, New(Default()), 2)
+	if got := binary.LittleEndian.Uint16(status[42:]); got != 0x3ff {
+		t.Fatalf("capabilities %#x", got)
+	}
+}
+
+// commitTyped runs one request through stage and commit and returns report 3 after it.
+func commitTyped(t *testing.T, d *Device, op byte, sequence uint32, payload ...byte) [hid.ReportSize]byte {
+	t.Helper()
+	d.Set(frame(op, 7, sequence, uint16(len(payload)), 0, payload...))
+	d.Set(frame(6, 7, sequence, 0, 0))
+	return mustGet(t, d, 3)
+}
+
+func TestCachedSlotSixIsTheSettingsSnapshot(t *testing.T) {
+	d := New(Default())
+	reply := commitTyped(t, d, 3, 1, 6)
+	if reply[21] != 3 || reply[22] != 1 || reply[23] != 4 || binary.LittleEndian.Uint16(reply[16:]) != 2+4*13 {
+		t.Fatalf("% x", reply[:30])
+	}
+	d.SetFlags(0x01)
+	if reply := commitTyped(t, d, 3, 2, 6); reply[21] != 3 || binary.LittleEndian.Uint16(reply[16:]) != 0 {
+		t.Fatalf("not ready: % x", reply[:24])
+	}
+	if reply := commitTyped(t, d, 3, 3, 7); reply[21] != 4 || reply[22] != 1 {
+		t.Fatalf("slot 7: % x", reply[:24])
+	}
+}
+
+func TestAAPOutsideTheListIsRefused(t *testing.T) {
+	clock := []byte{4, 0, 4, 0, 0x1b, 0, 0, 0, 0, 0, 0x3f, 0x42, 0x0f, 0, 25, 0} // 999999 us
+	clock = append(clock, "2026-11-07T12:34:56+00:00"...)
+	for _, tc := range []struct {
+		name    string
+		packet  []byte
+		allowed bool
+	}{
+		{"hearing", []byte{4, 0, 4, 0, 9, 0, 0x2c, 1, 2, 0, 0}, true},
+		{"hearing out of range", []byte{4, 0, 4, 0, 9, 0, 0x2c, 3, 2, 0, 0}, false},
+		{"assist", []byte{4, 0, 4, 0, 9, 0, 0x33, 1, 0, 0, 0}, true},
+		{"transparency", []byte{4, 0, 4, 0, 9, 0, 0x0d, 3, 0, 0, 0}, true},
+		{"mode off", []byte{4, 0, 4, 0, 9, 0, 0x0d, 1, 0, 0, 0}, false},
+		{"media assist", PMERecord(), true},
+		{"report request", requestNotifications, true},
+		{"host clock", clock, true},
+		{"host clock in a zone", append(append([]byte(nil), clock[:35]...), "+01:00"...), false},
+		{"eq", []byte{4, 0, 4, 0, 0x63, 0, 5, 0, 1, 2, 10, 50, 100}, false},
+		{"rename", []byte{4, 0, 4, 0, 0x1a, 0, 1, 4, 0, 'A', 'l', 'e', 'x'}, false},
+	} {
+		if got := aapAllowed(tc.packet); got != tc.allowed {
+			t.Errorf("%s: %v", tc.name, got)
+		}
+	}
+	if len(clock) != 41 {
+		t.Fatalf("clock is %d bytes", len(clock))
+	}
+}

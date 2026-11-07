@@ -317,14 +317,22 @@ func (s *SettingsClient) writable() (Status, error) {
 	return status, nil
 }
 
-// Read returns the current settings snapshot keyed by control ID. A dongle's capabilities are
-// fixed for a generation, so this does not read the status again just to check them.
+// Read returns the current settings snapshot keyed by control ID. It holds only what the
+// AirPods have reported so far, so a read right after connecting can be partial; read
+// again to see more. A refusal while the AirPods controls are not ready is an Unsupported
+// that also matches ErrNotReady. A dongle's capabilities are fixed for a generation, so this
+// does not read the status again just to check them.
 func (s *SettingsClient) Read() (map[byte]Record, error) {
-	if s.status.Capabilities&CapSettings == 0 {
+	if s.status.Capabilities&CapTypedRPC == 0 {
 		return nil, errors.New("Firmware does not advertise typed settings support")
 	}
 	generation := s.generation
 	reply, err := s.client.TypedRequest([]byte{2}, &generation)
+	var unsupported *Unsupported
+	if errors.As(err, &unsupported) {
+		// The dongle refuses the snapshot only before its AirPods controls are ready.
+		return nil, &Unsupported{Message: "AirPods controls are not ready yet; read the settings again in a moment", Err: ErrNotReady}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -387,7 +395,7 @@ func (s *SettingsClient) Send(name string, value uint32) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if status.Capabilities&CapSettings == 0 {
+	if status.Capabilities&CapTypedRPC == 0 {
 		return "", errors.New("Firmware does not advertise typed settings support")
 	}
 	if err := s.write(name, setting.Control, value); err != nil {

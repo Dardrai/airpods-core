@@ -292,11 +292,23 @@ func sendFailure(name string, err error) error {
 	return unconfirmedWrite("Could not confirm "+name+" was sent. It may or may not have arrived.", err)
 }
 
+// unlistedFailure words a failed send of a packet outside the dongle's fixed list of AAP
+// packets. Firmware up to at least 0.1.62 refuses such a packet with code 6 before sending
+// anything, so that code is a refusal here; anything else keeps the honest uncertainty.
+func unlistedFailure(name string, err error) error {
+	var rejected *dongle.RequestRejected
+	if errors.As(err, &rejected) && rejected.Code == 6 {
+		return &Refused{Reason: "The dongle refused to pass " + name + " on to the AirPods: its firmware only sends a fixed list of AirPods requests. Nothing was sent.", cause: err}
+	}
+	return sendFailure(name, err)
+}
+
 // ExperimentalSendEQ sends a custom EQ. There is no readback, so success is only ever
 // StatusSent: the result must read "sent", never "confirmed". Sent once.
 //
 // Gating: model.Profile.CustomEQ and firmware major 9 or newer are enforced here; callers need
-// the experimental switch. UNVERIFIED over the dongle: the AirPods may ignore it with no error.
+// the experimental switch. Current dongle firmware refuses this packet, which is reported as
+// Refused. UNVERIFIED over the dongle: the AirPods may ignore it with no error.
 // Blocking; run it on the device owner goroutine.
 func ExperimentalSendEQ(c *dongle.Client, eq EQ) (SendResult, error) {
 	if !eq.Valid() {
@@ -311,7 +323,7 @@ func ExperimentalSendEQ(c *dongle.Client, eq EQ) (SendResult, error) {
 		return SendResult{}, refuse("Custom EQ needs firmware 9 or newer on these AirPods.")
 	}
 	if err := o.SendAAP(eqPacket(eq)); err != nil {
-		return SendResult{}, sendFailure("EQ", err)
+		return SendResult{}, unlistedFailure("EQ", err)
 	}
 	return SendResult{Status: StatusSent, Note: "Sent to the AirPods. They do not confirm EQ, so its effect is unknown."}, nil
 }
@@ -328,7 +340,8 @@ func renamePacket(name string) []byte {
 // characters. There is no readback, so success is only ever StatusSent, and the system may
 // show the old name until the AirPods reconnect. Sent once.
 //
-// Gating: no model flag; callers need the experimental switch. UNVERIFIED over the dongle.
+// Gating: no model flag; callers need the experimental switch. Current dongle firmware refuses
+// this packet, which is reported as Refused. UNVERIFIED over the dongle.
 // Blocking; run it on the device owner goroutine.
 func ExperimentalRename(c *dongle.Client, name string) (SendResult, error) {
 	if !utf8.ValidString(name) || strings.TrimSpace(name) == "" || len(name) > MaxNameBytes || strings.ContainsFunc(name, unicode.IsControl) {
@@ -340,7 +353,7 @@ func ExperimentalRename(c *dongle.Client, name string) (SendResult, error) {
 	}
 	defer o.close()
 	if err := o.SendAAP(renamePacket(name)); err != nil {
-		return SendResult{}, sendFailure("the name", err)
+		return SendResult{}, unlistedFailure("the name", err)
 	}
 	return SendResult{Status: StatusSent, Note: "Sent to the AirPods. The old name may show until they reconnect."}, nil
 }

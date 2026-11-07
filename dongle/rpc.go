@@ -290,7 +290,7 @@ func (t *transaction) wait(limit time.Duration, accept func(report [hid.ReportSi
 				// The dongle has ended the request, so there is nothing left to cancel.
 				t.active = false
 				if report[22] == codeUnsupported {
-					return none, &Unsupported{"Firmware does not support this request for this device"}
+					return none, &Unsupported{Message: "Firmware does not support this request for this device"}
 				}
 				return none, &RequestRejected{report[22]}
 			}

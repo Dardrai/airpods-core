@@ -3,6 +3,7 @@ package dongle
 import (
 	"encoding/binary"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/Dardrai/airpods-core/dongle/sim"
@@ -138,25 +139,32 @@ func TestControlReceiptResults(t *testing.T) {
 	}
 }
 
-func TestGenericCommandReachesDeviceWithNewOpcode(t *testing.T) {
+// The dongle answers an opcode outside 1..4 as malformed and records opcode 0, so the
+// receipt is matched by its sequence and returned at once instead of after 2 s.
+func TestUnknownOpcodeIsMalformedAtOnce(t *testing.T) {
 	cfg := sim.Default()
 	cfg.Capabilities = 0
 	client, device := newClient(cfg)
-	var seen [2]byte
-	device.OnControl = func(opcode, arg byte) byte {
-		seen = [2]byte{opcode, arg}
-		return ResultOK
-	}
-	if err := client.Command(5, 9); err != nil {
-		t.Fatal(err)
-	}
-	if seen != [2]byte{5, 9} {
-		t.Fatalf("seen %v", seen)
-	}
-	device.OnControl = nil
 	var rejected *ControlRejected
-	if err := client.Command(5, 0); !errors.As(err, &rejected) || rejected.Result != ResultUnsupported {
+	if err := client.Command(5, 0); !errors.As(err, &rejected) || rejected.Result != ResultMalformed || rejected.Opcode != 5 {
 		t.Fatalf("unknown opcode: %v", err)
+	}
+	if ops, _ := device.TraceSummary(); ops != 3 {
+		t.Errorf("%d operations, want a read, the write and one receipt read", ops)
+	}
+	status, _ := client.Status()
+	if status.ReceiptOpcode != 0 || status.ReceiptResult != ResultMalformed {
+		t.Errorf("receipt opcode %d result %d", status.ReceiptOpcode, status.ReceiptResult)
+	}
+	if !strings.Contains(rejected.Error(), "malformed") {
+		t.Errorf("text %q", rejected)
+	}
+}
+
+func TestBusyTextNamesOtherCompanionWork(t *testing.T) {
+	err := &ControlRejected{Opcode: OpReconnect, Result: ResultBusy}
+	if !strings.Contains(err.Error(), "another companion request or settings session") {
+		t.Errorf("text %q", err)
 	}
 }
 

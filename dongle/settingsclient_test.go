@@ -3,6 +3,7 @@ package dongle
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/Dardrai/airpods-core/dongle/sim"
@@ -46,7 +47,7 @@ func TestSetClassification(t *testing.T) {
 		{"write transport", func(c *sim.Config) { c.SetFailOnWrite = true; c.FailMessage = "boom" }, unconfirmed, "mode: change not confirmed: boom. It may have applied; read it again before retrying."},
 		{"session change", func(c *sim.Config) { c.GenerationChangeAfterWrite = true }, unconfirmed, "mode: change not confirmed: Pico session changed during request. It may have applied; read it again before retrying."},
 		{"confirm rejected", func(c *sim.Config) { c.SnapshotFailAfterWrite = 4 }, unconfirmed, "mode: change not confirmed: RPC failure: AirPods disconnected. It may have applied; read it again before retrying."},
-		{"confirm unsupported", func(c *sim.Config) { c.SnapshotFailAfterWrite = 7 }, unconfirmed, "mode: change not confirmed: Firmware does not support this request for this device. It may have applied; read it again before retrying."},
+		{"confirm unsupported", func(c *sim.Config) { c.SnapshotFailAfterWrite = 7 }, unconfirmed, "mode: change not confirmed: AirPods controls are not ready yet; read the settings again in a moment. It may have applied; read it again before retrying."},
 		{"confirm garbage", func(c *sim.Config) { c.SnapshotGarbageAfterWrite = true }, unconfirmed, "mode: change not confirmed: Malformed settings snapshot. It may have applied; read it again before retrying."},
 		{"never fresh", func(c *sim.Config) { c.WriteMode = sim.WriteLost }, unconfirmed, "mode: sent, but no fresh matching device report. It may have applied; use get mode before retrying."},
 		{"same revision", func(c *sim.Config) { c.WriteMode = sim.WriteSameRevision }, unconfirmed, "mode: sent, but no fresh matching device report. It may have applied; use get mode before retrying."},
@@ -445,5 +446,96 @@ func TestUnconfirmedKeepsItsCauseButNeverMatchesErrNotSent(t *testing.T) {
 	}
 	if got := errors.Unwrap(&Unconfirmed{}); got != nil {
 		t.Errorf("no cause: %v", got)
+	}
+}
+
+// The dongle refuses the snapshot with code 7 only while its AirPods controls are not
+// ready, so that refusal is not reported as missing support.
+func TestSnapshotRefusalMeansControlsNotReady(t *testing.T) {
+	cfg := sim.Default()
+	cfg.Flags = 0x01
+	cfg.SettingsNeedReady = true
+	settings, device := settingsFor(t, cfg)
+	_, err := settings.Read()
+	var unsupported *Unsupported
+	if !errors.Is(err, ErrNotReady) || !errors.As(err, &unsupported) || err.Error() != "AirPods controls are not ready yet; read the settings again in a moment" {
+		t.Fatalf("err = %v", err)
+	}
+	device.SetFlags(0x03)
+	if values, err := settings.Read(); err != nil || len(values) != 4 {
+		t.Fatalf("after ready: %v %v", values, err)
+	}
+	// Another request refused with code 7 still means unsupported.
+	client, _ := newClient(sim.Default())
+	if _, err := client.TypedRequest([]byte{99}, nil); errors.Is(err, ErrNotReady) || !errors.As(err, &unsupported) {
+		t.Errorf("other kind: %v", err)
+	}
+}
+
+func TestSettingsArriveOverSuccessiveReads(t *testing.T) {
+	cfg := sim.Default()
+	cfg.SettingsPerRead = 3
+	settings, _ := settingsFor(t, sim.Demo())
+	all, err := settings.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Settings = sim.Demo().Settings
+	settings, _ = settingsFor(t, cfg)
+	var sizes []int
+	for range 9 {
+		values, err := settings.Read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		sizes = append(sizes, len(values))
+	}
+	want := []int{3, 6, 9, 12, 15, 18, 21, 22, 22}
+	if len(all) != 22 || fmt.Sprint(sizes) != fmt.Sprint(want) {
+		t.Errorf("sizes %v of %d", sizes, len(all))
+	}
+}
+
+func TestAllowOffGateNeedsAllowOffInThisGeneration(t *testing.T) {
+	cfg := sim.Default()
+	cfg.AllowOffGate = true
+	settings, device := settingsFor(t, cfg)
+	var unsupported *Unsupported
+	for _, write := range []struct {
+		name  string
+		value uint32
+	}{{"mode", 1}, {"hold-modes", 3}} {
+		if _, err := settings.Set(write.name, write.value); !errors.As(err, &unsupported) {
+			t.Errorf("%s before allow-off: %v", write.name, err)
+		}
+	}
+	if _, err := settings.Set("hold-modes", 6); err != nil {
+		t.Errorf("hold-modes without off: %v", err)
+	}
+	if _, err := settings.Send("allow-off", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := settings.Set("mode", 1); err != nil {
+		t.Errorf("mode off after allow-off: %v", err)
+	}
+	if _, err := settings.Set("mode", 2); err != nil {
+		t.Fatal(err)
+	}
+	// A reconnect starts a new generation, and the dongle has forgotten Allow Off.
+	device.BumpGeneration()
+	client := NewClient(device)
+	client.SetClock(sim.NewVirtualClock())
+	settings, err := client.SettingsClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := settings.Set("mode", 1); !errors.As(err, &unsupported) {
+		t.Errorf("mode off in a new generation: %v", err)
+	}
+	if _, err := settings.Send("allow-off", 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := settings.Set("mode", 1); !errors.As(err, &unsupported) {
+		t.Errorf("mode off after allow-off off: %v", err)
 	}
 }

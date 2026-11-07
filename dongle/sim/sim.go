@@ -140,16 +140,33 @@ type Config struct {
 	Exchange func(pdu []byte) []byte `json:"-"`
 	// OnAAP observes AAP packets sent to the AirPods.
 	OnAAP func(pdu []byte) `json:"-"`
+	// AnyAAP passes every AAP packet on instead of refusing those outside the dongle's
+	// fixed list with code 6, for testing packets no firmware sends yet.
+	AnyAAP bool `json:"-"`
 	// SettingsNeedReady refuses the settings snapshot as unsupported until controls are
 	// ready, as a dongle in the middle of connecting could.
 	SettingsNeedReady bool `json:"-"`
+	// SettingsPerRead, when nonzero, makes the first snapshot list only this many of
+	// Settings and each later one this many more, the way reports trickle in after connecting.
+	SettingsPerRead int `json:"settings_per_read"`
+	// AllowOffGate refuses Off (mode off, or hold-modes with off) as unsupported until
+	// allow-off on is written in the current generation, as the dongle does for AirPods
+	// that apply Allow Off without reporting it.
+	AllowOffGate bool `json:"allow_off_gate"`
 	// FailTimes refuses a typed request kind as unsupported this many times, then serves it.
 	FailTimes map[byte]int `json:"-"`
 	// Cached holds the AirPods reports the dongle has kept, by slot.
 	Cached map[byte]CachedReport `json:"-"`
-	// DisconnectOpcode, when nonzero, is an opcode that ends the AirPods connection;
-	// reconnect then brings it back. Capabilities are the config's to advertise.
-	DisconnectOpcode byte `json:"disconnect_opcode"`
+
+	// RoutingCloseDelay is how many routing status reads an accepted release stays
+	// pending before the connection closes; at 0 it closes at once.
+	RoutingCloseDelay int `json:"routing_close_delay"`
+	// RoutingTakeoverDelay is how many routing status reads an accepted acquire stays
+	// pending before the dongle owns the AirPods; at 0 it owns them at once.
+	RoutingTakeoverDelay int `json:"routing_takeover_delay"`
+	// RoutingBusy refuses routing handovers as busy, as a call, a codec change or a
+	// Game Mode write in flight would.
+	RoutingBusy bool `json:"routing_busy"`
 }
 
 // CachedReport is one kept report: how old it is, its reception revision and its packet.
@@ -170,7 +187,7 @@ func Default() Config {
 		Battery:      [3]byte{80, 70, 255},
 		Codec:        2,
 		Ages:         [3]uint32{1000, 1000, 0xffffffff},
-		Capabilities: 0x7f,
+		Capabilities: 0x3ff,
 		Settings: []Setting{
 			{Control: 0x0d, Age: 1200, Revision: 5, Value: 2},
 			{Control: 0x0a, Age: 300, Revision: 2, Value: 2},
@@ -226,11 +243,18 @@ type Device struct {
 	receiptOpcode  byte
 	receiptPending func()
 	receiptIn      int
+
+	snapshotReads      int
+	allowOffSent       bool
+	allowOffOn         bool
+	allowOffGeneration uint32
+
+	routing routingState
 }
 
 // New builds a device from a config.
 func New(cfg Config) *Device {
-	d := &Device{cfg: cfg, receiptSeq: cfg.ReceiptSequence}
+	d := &Device{cfg: cfg, receiptSeq: cfg.ReceiptSequence, routing: routingState{revision: 1}}
 	d.cfg.Settings = append([]Setting(nil), cfg.Settings...)
 	header := hid.Header(3)
 	copy(d.reply[:], header[:])
@@ -436,10 +460,9 @@ func (d *Device) control(data [hid.ReportSize]byte) {
 	opcode, arg := data[7], data[22]
 	sequence := le.Uint32(data[18:])
 	result := ResultFor(opcode)
-	if d.cfg.DisconnectOpcode != 0 && opcode == d.cfg.DisconnectOpcode {
-		result = 1
-	}
 	switch {
+	case result == 6:
+		opcode = 0 // The dongle records an unknown opcode as 0.
 	case d.OnControl != nil:
 		result = d.OnControl(opcode, arg)
 	case d.cfg.ControlResults[opcode] != 0:
@@ -458,15 +481,9 @@ func (d *Device) control(data [hid.ReportSize]byte) {
 		if result != 1 {
 			return
 		}
-		if d.cfg.DisconnectOpcode != 0 {
-			switch opcode {
-			case d.cfg.DisconnectOpcode:
-				d.cfg.Flags &^= 0x07
-			case 1:
-				d.cfg.Flags |= 0x03
-			}
-		}
 		switch opcode {
+		case 1:
+			d.takeoverRequested()
 		case 2:
 			d.cfg.Generation++ // Pairing starts a new connection generation.
 		case 3:
@@ -477,12 +494,12 @@ func (d *Device) control(data [hid.ReportSize]byte) {
 	}
 }
 
-// ResultFor is the default receipt: known opcodes succeed, others are unsupported.
+// ResultFor is the default receipt: known opcodes succeed, others are malformed.
 func ResultFor(opcode byte) byte {
 	if opcode >= 1 && opcode <= 4 {
 		return 1
 	}
-	return 4
+	return 6
 }
 
 func (d *Device) typed(data [hid.ReportSize]byte) {
@@ -634,6 +651,9 @@ func (d *Device) respond() ([]byte, byte) {
 			return nil, 3
 		}
 		if d.stagedOp == 2 {
+			if !d.cfg.AnyAAP && !aapAllowed(request) {
+				return nil, 6 // The dongle sends only the packets it knows; nothing went out.
+			}
 			d.aapSent = append(d.aapSent, append([]byte(nil), request...))
 			if d.cfg.OnAAP != nil {
 				d.cfg.OnAAP(request)
@@ -673,10 +693,14 @@ func (d *Device) respond() ([]byte, byte) {
 		return out, 0
 	}
 	switch kind {
+	case 20, 21:
+		return d.routingRequest(request)
 	case 3, 4, 9:
 		return defaultAudio(), 0
 	case 5:
 		return defaultPerformance(), 0
+	case 11, 13, 15, 19:
+		return defaultDiagnostic(kind), 0
 	case 6, 7:
 		return defaultNearby(kind == 6), 0
 	case 8, 12, 14, 18:
@@ -695,8 +719,15 @@ func (d *Device) respond() ([]byte, byte) {
 
 // cachedReply is the envelope of a kept report, empty when the slot holds nothing.
 func (d *Device) cachedReply(request []byte) ([]byte, byte) {
-	if len(request) != 1 || request[0] < 1 || request[0] > 5 {
+	if len(request) != 1 || request[0] < 1 || request[0] > 6 {
 		return nil, 1
+	}
+	if request[0] == 6 {
+		// Slot 6 is the settings snapshot itself, empty until controls are ready.
+		if d.cfg.Flags&2 == 0 {
+			return nil, 0
+		}
+		return d.snapshotBytes(), 0
 	}
 	report, ok := d.cfg.Cached[request[0]]
 	if !ok {
@@ -725,14 +756,24 @@ func (d *Device) snapshot() ([]byte, byte) {
 			d.applyIn--
 		}
 	}
-	out := []byte{1, byte(len(d.cfg.Settings))}
-	for _, s := range d.cfg.Settings {
+	d.snapshotReads++
+	return d.snapshotBytes(), 0
+}
+
+// snapshotBytes encodes the settings the dongle has received so far.
+func (d *Device) snapshotBytes() []byte {
+	settings := d.cfg.Settings
+	if d.cfg.SettingsPerRead > 0 {
+		settings = settings[:min(len(settings), d.cfg.SettingsPerRead*max(d.snapshotReads, 1))]
+	}
+	out := []byte{1, byte(len(settings))}
+	for _, s := range settings {
 		out = append(out, s.Control)
 		out = binary.LittleEndian.AppendUint32(out, s.Age)
 		out = binary.LittleEndian.AppendUint32(out, s.Revision)
 		out = binary.LittleEndian.AppendUint32(out, s.Value)
 	}
-	return out, 0
+	return out
 }
 
 func (d *Device) applyWrite(write Setting) {
@@ -768,13 +809,20 @@ func (d *Device) writeSetting(request []byte) ([]byte, byte) {
 	if len(request) != 6 {
 		return nil, 1
 	}
+	control, value := request[1], binary.LittleEndian.Uint32(request[2:])
+	if d.cfg.AllowOffGate && d.offRefused(control, value) {
+		return nil, 7
+	}
+	if control == 0x34 {
+		d.allowOffSent, d.allowOffOn, d.allowOffGeneration = true, value == 1, d.cfg.Generation
+	}
 	d.written = true
 	d.writes++
 	if d.cfg.GenerationChangeAfterWrite {
 		d.cfg.Generation++
 	}
 	if d.cfg.WriteMode != WriteLost {
-		d.pendingWrite = &Setting{Control: request[1], Value: binary.LittleEndian.Uint32(request[2:])}
+		d.pendingWrite = &Setting{Control: control, Value: value}
 		d.applyIn = d.cfg.ApplyAfterReads
 	}
 	return append([]byte(nil), d.cfg.WriteReply...), 0
@@ -855,4 +903,68 @@ func (c *VirtualClock) Sleep(d time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.now = c.now.Add(d)
+}
+
+// offRefused applies the Allow Off rule of AllowOffGate: Off needs allow-off on written in
+// this generation, unless the AirPods already report mode off.
+func (d *Device) offRefused(control byte, value uint32) bool {
+	if !(control == 0x0d && value == 1) && !(control == 0x1a && value&1 != 0) {
+		return false
+	}
+	if d.allowOffSent && d.allowOffGeneration == d.cfg.Generation {
+		return !d.allowOffOn
+	}
+	for _, s := range d.cfg.Settings {
+		if s.Control == 0x0d && s.Value == 1 {
+			return false
+		}
+	}
+	return true
+}
+
+// defaultDiagnostic is a plausible reply to the diagnostic reads: kind 11 audio trace,
+// 13 audio inspection, 15 phone counters and 19 radio snapshot.
+func defaultDiagnostic(kind byte) []byte {
+	le := binary.LittleEndian
+	switch kind {
+	case 11:
+		reply := make([]byte, 512)
+		reply[0], reply[1], reply[2] = 1, 0x10, 1
+		for i := 4; i < 128; i += 4 {
+			le.PutUint32(reply[i:], uint32(i))
+		}
+		le.PutUint32(reply[128:], 5000) // one drop event
+		le.PutUint32(reply[132:], 1)
+		le.PutUint32(reply[136:], 2)
+		return reply
+	case 13:
+		reply := make([]byte, 400)
+		reply[0], reply[1], reply[2], reply[3] = 1, 3, 2, 2 // active, two config bytes
+		le.PutUint32(reply[48:], 4)                         // four access unit bytes
+		copy(reply[68:], []byte{0xf8, 0xf0})
+		copy(reply[80:], []byte{1, 2, 3, 4})
+		return reply
+	case 15:
+		reply := make([]byte, 64)
+		reply[0], reply[1], reply[3] = 2, 2, 15
+		for i := 4; i < 64; i += 4 {
+			le.PutUint32(reply[i:], uint32(i))
+		}
+		le.PutUint32(reply[40:], 1) // output ready
+		return reply
+	}
+	reply := make([]byte, 128)
+	reply[0], reply[1], reply[2], reply[3] = 1, 128, 1, 0x1f
+	reply[16], reply[17], reply[18], reply[19], reply[20] = 0xfb, 255, 4, 10, 1
+	for i := 21; i < 31; i++ {
+		reply[i] = 0xff
+	}
+	for i := 32; i < 52; i += 4 {
+		le.PutUint32(reply[i:], 100)
+	}
+	reply[64], reply[65], reply[66] = 1, 1, 2 // adaptive, active, clean
+	for i := 68; i < 128; i += 4 {
+		le.PutUint32(reply[i:], uint32(i))
+	}
+	return reply
 }

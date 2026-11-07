@@ -164,3 +164,23 @@ func (v View) ValueAllowed(control byte, value uint32) bool {
 	}
 	return true
 }
+
+// NeedsAllowOffResend reports whether a write must be preceded by allow-off on (0x34 = 1)
+// in this connection generation. The dongle forgets an Allow Off write whenever the AirPods
+// connect again, and for models that never report Allow Off it then refuses mode off and
+// hold-modes with off as unsupported until Allow Off is sent again. sentThisGeneration says
+// whether allow-off on was already sent since the generation began.
+func (v View) NeedsAllowOffResend(control byte, value uint32, sentThisGeneration bool) bool {
+	wantsOff := (control == ControlMode && value == 1) || (control == ControlCycle && value&1 != 0)
+	if !wantsOff || sentThisGeneration || !SilentAllowOff(v.Model) {
+		return false
+	}
+	if _, reported := v.Reported[ControlAllowOff]; reported {
+		return false
+	}
+	// The dongle also allows Off while the AirPods report it, and on firmware before 7.
+	if major := v.major(); v.Reported[ControlMode] == 1 || (major >= 1 && major <= 6) {
+		return false
+	}
+	return true
+}
