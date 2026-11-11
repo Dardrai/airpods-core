@@ -115,7 +115,7 @@ func (s *Session) Feature(payload []byte) ([]byte, error) { return s.do(opFeatur
 
 // Cached reads a kept report inside the session; nil means the slot holds nothing.
 func (s *Session) Cached(slot byte) (*Cached, error) {
-	if slot < SlotMetadata || slot > SlotEarStatus {
+	if !readableSlot(slot) {
 		return nil, errors.New("Unknown dongle report.")
 	}
 	reply, err := s.do(opCached, []byte{slot})

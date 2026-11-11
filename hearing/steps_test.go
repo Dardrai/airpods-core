@@ -186,18 +186,18 @@ func TestApplyStepsWriteOnceAndHoldNothingBetween(t *testing.T) {
 		t.Fatal(err)
 	}
 	if a.Server.Writes != 0 {
-		t.Error("written before the enable was confirmed")
+		t.Error("written before the first step")
 	}
-	var result *ProfileResult
-	for done := false; !done; {
-		freeBetweenSteps(t, client, dev)
-		result, done, err = apply.Step(client)
-		if err != nil {
-			t.Fatal(err)
-		}
+	freeBetweenSteps(t, client, dev)
+	result, done, err := apply.Step(client)
+	if !done || err != nil || a.Server.Writes != 1 || !result.Written || result.Settings.OwnVoice != 0.25 {
+		t.Fatalf("done %v, err %v, writes %d, result %+v", done, err, a.Server.Writes, result)
 	}
-	if a.Server.Writes != 1 || !result.Enabled || result.Settings.OwnVoice != 0.25 {
-		t.Errorf("writes %d, result %+v", a.Server.Writes, result)
+	if again, done, err := apply.Step(client); again != result || !done || err != nil || a.Server.Writes != 1 {
+		t.Error("a finished apply must keep its outcome and never write again")
+	}
+	if len(a.Received) != 0 {
+		t.Errorf("sent %x", a.Received)
 	}
 	freeBetweenSteps(t, client, dev)
 	if _, err := modes.StartSet(client, HearingAid, false); err != nil {
@@ -205,30 +205,28 @@ func TestApplyStepsWriteOnceAndHoldNothingBetween(t *testing.T) {
 	}
 }
 
-func TestApplyWaitsWithoutWritingWhileAnEnableGoesUnconfirmed(t *testing.T) {
+func TestApplyWaitsWithoutWritingWhileAnotherClientHoldsTheChannel(t *testing.T) {
 	a := proThree()
-	a.Silent = true
-	client, _ := rig(t, a)
+	client, dev := rig(t, a)
 	modes := new(Modes)
 	expected := readBaseline(t, client, modes)
-	apply, err := modes.StartApplyProfile(client, expected, expected)
+	requested := expected
+	requested.OwnVoice = 0.25
+	apply, err := modes.StartApplyProfile(client, expected, requested)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for done := false; !done; {
-		_, done, err = apply.Step(client)
-		client.Clock().Sleep(confirmPoll)
+	dev.Update(func(cfg *sim.Config) { cfg.Fail = map[byte]byte{leaseKind: 2} })
+	if _, done, err := apply.Step(client); done || err != nil || a.Server.Writes != 0 {
+		t.Fatalf("done %v, err %v, writes %d", done, err, a.Server.Writes)
 	}
-	var partial *ModeUnconfirmed
-	if !errors.As(err, &partial) || !strings.Contains(err.Error(), "may still be active") {
-		t.Fatalf("err %#v", err)
-	}
-	if a.Server.Writes != 0 || modes.Recovery() == nil {
-		t.Errorf("writes %d, recovery %+v", a.Server.Writes, modes.Recovery())
+	dev.Update(func(cfg *sim.Config) { cfg.Fail = nil })
+	if _, done, err := apply.Step(client); !done || err != nil || a.Server.Writes != 1 {
+		t.Fatalf("done %v, err %v, writes %d", done, err, a.Server.Writes)
 	}
 }
 
-func TestApplyAbsentSaysWhatMayBeLeftOn(t *testing.T) {
+func TestApplyAbsentWritesNothing(t *testing.T) {
 	a := proThree()
 	client, _ := rig(t, a)
 	modes := new(Modes)
@@ -237,25 +235,16 @@ func TestApplyAbsentSaysWhatMayBeLeftOn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, done, err := apply.Absent(errors.New("no dongle"))
-	if !done || err == nil || !strings.Contains(err.Error(), "may still be active") || modes.Recovery() == nil {
+	cause := errors.New("no dongle")
+	_, done, err := apply.Absent(cause)
+	if !done || err != cause || modes.Recovery() != nil {
 		t.Fatalf("done %v, err %v, recovery %+v", done, err, modes.Recovery())
 	}
-	if a.Server.Writes != 0 {
-		t.Error("written")
+	if a.Server.Writes != 0 || len(a.Received) != 0 {
+		t.Error("touched the AirPods")
 	}
-	// A pair with the mode already on has nothing to undo.
-	b := enabled()
-	client, _ = rig(t, b)
-	modes = new(Modes)
-	expected = readBaseline(t, client, modes)
-	apply, err = modes.StartApplyProfile(client, expected, expected)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, done, err = apply.Absent(errors.New("no dongle"))
-	if !done || err == nil || strings.Contains(err.Error(), "may still be active") || modes.Recovery() != nil {
-		t.Fatalf("done %v, err %v, recovery %+v", done, err, modes.Recovery())
+	if _, err := modes.StartSet(client, HearingAid, false); err != nil {
+		t.Errorf("the apply did not let go: %v", err)
 	}
 }
 
@@ -516,9 +505,10 @@ func (d *reconnectingDevice) Get(report byte) ([hid.ReportSize]byte, error) {
 func TestAReconnectAfterAWriteIsNeverErrNotSent(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
+		pair  func() *sim.HearingAirPods
 		write func(t *testing.T, client *dongle.Client) error
 	}{
-		{"profile", func(t *testing.T, client *dongle.Client) error {
+		{"profile", enabled, func(t *testing.T, client *dongle.Client) error {
 			modes := new(Modes)
 			expected := readBaseline(t, client, modes)
 			requested := expected
@@ -526,7 +516,7 @@ func TestAReconnectAfterAWriteIsNeverErrNotSent(t *testing.T) {
 			_, err := modes.ApplyProfile(client, expected, requested)
 			return err
 		}},
-		{"transparency", func(t *testing.T, client *dongle.Client) error {
+		{"transparency", proThree, func(t *testing.T, client *dongle.Client) error {
 			modes := new(Modes)
 			expected, err := modes.ExperimentalReadTransparency(client)
 			if err != nil {
@@ -537,7 +527,7 @@ func TestAReconnectAfterAWriteIsNeverErrNotSent(t *testing.T) {
 			_, err = modes.ExperimentalWriteTransparency(client, expected, requested)
 			return err
 		}},
-		{"loud sound", func(t *testing.T, client *dongle.Client) error {
+		{"loud sound", enabled, func(t *testing.T, client *dongle.Client) error {
 			_, err := ExperimentalSetLoudSoundReduction(client, false, true)
 			return err
 		}},
@@ -545,7 +535,7 @@ func TestAReconnectAfterAWriteIsNeverErrNotSent(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			unsentReads, finished := 0, false
 			for at := 1; at <= 200 && !finished; at++ {
-				a := enabled()
+				a := tc.pair()
 				device := &reconnectingDevice{Device: sim.New(a.Config()), airpods: a, at: at}
 				client := dongle.NewClient(device)
 				client.SetClock(sim.NewVirtualClock())

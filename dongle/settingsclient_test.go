@@ -539,3 +539,107 @@ func TestAllowOffGateNeedsAllowOffInThisGeneration(t *testing.T) {
 		t.Errorf("mode off after allow-off off: %v", err)
 	}
 }
+
+// snapshotRequests returns every kind 2 request the dongle received.
+func snapshotRequests(device *sim.Device) []string {
+	var found []string
+	for _, payload := range device.Commits() {
+		if len(payload) > 0 && payload[0] == 2 {
+			found = append(found, fmt.Sprintf("% x", payload))
+		}
+	}
+	return found
+}
+
+func newSettings() sim.Config {
+	cfg := sim.Default()
+	cfg.Settings = append(cfg.Settings, sim.Setting{Control: 0x37, Age: 5, Revision: 1, Value: 2}, sim.Setting{Control: 0x2f, Age: 5, Revision: 1, Value: 1})
+	return cfg
+}
+
+func TestReadAsksForTheExtendedSnapshot(t *testing.T) {
+	settings, device := settingsFor(t, newSettings())
+	values, err := settings.Read()
+	if err != nil || len(values) != 6 || values[0x37].Value != 2 || values[0x2f].Value != 1 {
+		t.Fatalf("%v %v", values, err)
+	}
+	if got := fmt.Sprint(snapshotRequests(device)); got != "[02 01]" {
+		t.Errorf("requests %s", got)
+	}
+	// The legacy snapshot leaves the newer settings out.
+	reply, err := settings.client.TypedRequest([]byte{2}, nil)
+	if legacy, _ := DecodeSnapshot(reply); err != nil || len(legacy) != 4 {
+		t.Errorf("legacy: %v %v", legacy, err)
+	}
+}
+
+// Firmware before 0.1.64 calls the extended request malformed: the client reads the legacy
+// snapshot from then on, without asking for the extended one again.
+func TestReadFallsBackOnceOnOldFirmware(t *testing.T) {
+	cfg := newSettings()
+	cfg.LegacySnapshotOnly = true
+	settings, device := settingsFor(t, cfg)
+	for range 2 {
+		if values, err := settings.Read(); err != nil || len(values) != 4 {
+			t.Fatalf("%v %v", values, err)
+		}
+	}
+	if got := fmt.Sprint(snapshotRequests(device)); got != "[02 01 02 02]" {
+		t.Errorf("requests %s", got)
+	}
+	// Another client asks again.
+	other, err := settings.client.SettingsClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.Read(); err != nil || len(snapshotRequests(device)) != 5 {
+		t.Errorf("other client: %v %v", err, snapshotRequests(device))
+	}
+}
+
+// Code 7 still means the controls are not ready, and busy or other failures are returned;
+// none of them makes the client fall back.
+func TestReadFallsBackOnlyOnMalformed(t *testing.T) {
+	cfg := newSettings()
+	cfg.Flags = 0x01
+	cfg.SettingsNeedReady = true
+	settings, device := settingsFor(t, cfg)
+	if _, err := settings.Read(); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("not ready: %v", err)
+	}
+	device.SetFlags(0x03)
+	if values, err := settings.Read(); err != nil || len(values) != 6 {
+		t.Fatalf("ready: %v %v", values, err)
+	}
+	if got := fmt.Sprint(snapshotRequests(device)); got != "[02 01 02 01]" {
+		t.Errorf("requests %s", got)
+	}
+	cfg = newSettings()
+	cfg.Fail = map[byte]byte{2: 2}
+	settings, device = settingsFor(t, cfg)
+	if _, err := settings.Read(); !rejected(2)(err) || len(snapshotRequests(device)) != 1 {
+		t.Errorf("busy: %v %v", err, snapshotRequests(device))
+	}
+}
+
+// The dongle writes en352-protection and gain-swipe only once the AirPods have reported them.
+func TestNewSettingsNeedAReport(t *testing.T) {
+	settings, device := settingsFor(t, sim.Default())
+	var unsupported *Unsupported
+	if _, err := settings.Set("gain-swipe", 1); !errors.As(err, &unsupported) {
+		t.Fatalf("unreported: %v", err)
+	}
+	settings, device = settingsFor(t, newSettings())
+	if text, err := settings.Set("en352-protection", 1); err != nil || text != "en352-protection: on (confirmed by AirPods)" {
+		t.Fatalf("reported: %q %v", text, err)
+	}
+	if device.Writes() != 1 {
+		t.Errorf("%d writes", device.Writes())
+	}
+	cfg := newSettings()
+	cfg.LegacySnapshotOnly = true
+	settings, _ = settingsFor(t, cfg)
+	if _, err := settings.Set("gain-swipe", 2); !errors.As(err, &unsupported) {
+		t.Errorf("old firmware: %v", err)
+	}
+}

@@ -12,7 +12,15 @@ const (
 	SlotHearingMedia byte = 3
 	SlotHearingPME   byte = 4
 	SlotEarStatus    byte = 5
+	// SlotEQ holds the AirPods' last valid EQ report, from firmware 0.1.64. Slot 6 is not a
+	// kept report: the dongle answers it with the settings snapshot, so it is never read here.
+	SlotEQ byte = 7
 )
+
+// readableSlot reports whether a slot holds a kept report in the age and revision envelope.
+func readableSlot(slot byte) bool {
+	return (slot >= SlotMetadata && slot <= SlotEarStatus) || slot == SlotEQ
+}
 
 // Cached is one kept report. Age and revision are separate: the same report can age
 // without a new reception.
@@ -42,7 +50,7 @@ func DecodeCached(reply []byte) (*Cached, error) {
 
 // Cached reads a kept report; nil means the slot holds nothing.
 func (c *Client) Cached(slot byte) (*Cached, error) {
-	if slot < SlotMetadata || slot > SlotEarStatus {
+	if !readableSlot(slot) {
 		return nil, errors.New("Unknown dongle report.")
 	}
 	reply, err := c.typedRequest(opCached, []byte{slot}, nil)

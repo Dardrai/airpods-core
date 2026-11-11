@@ -203,13 +203,13 @@ func triggerCheck(exchange Exchanger) error {
 	if found[0].WriteOpcode != attWrite {
 		return refuse("The hardware check request does not support a response.")
 	}
-	handle := found[0].Handle
-	response, err := exchange([]byte{attWrite, byte(handle), byte(handle >> 8), '1'})
+	request := writeRequest(*found[0], []byte{'1'})
+	response, err := exchange(request)
 	if err != nil {
 		return unconfirmedWrite("No reply to the hardware check request, so it may or may not have started.", err)
 	}
-	if !bytes.Equal(response, []byte{attWriteR}) {
-		return unconfirmed("The AirPods did not acknowledge the hardware check request.", errorText("Hardware check request.", response))
+	if err := writeAcknowledged("Hardware check request.", request, response); err != nil {
+		return unconfirmed("The AirPods did not acknowledge the hardware check request.", err)
 	}
 	return nil
 }

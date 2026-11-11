@@ -109,6 +109,10 @@ func TestControlValidation(t *testing.T) {
 		{"mode capability", func(c *sim.Config) { c.Capabilities = 0x7d }, OpListeningMode, ListeningANC, ResultUnsupported},
 		{"phone capability", func(c *sim.Config) { c.Capabilities = 0x7b }, OpPairPhone, 0, ResultUnsupported},
 		{"pair busy", func(c *sim.Config) { c.Flags = 0x43 }, OpPair, 0, ResultBusy},
+		{"pair microphone", func(c *sim.Config) { c.Flags = 0x13 }, OpPair, 0, ResultBusy},
+		{"pair phone relay", func(c *sim.Config) { c.Flags = 0x0b }, OpPair, 0, ResultBusy},
+		{"phone window playback", func(c *sim.Config) { c.Flags = 0x43 }, OpPairPhone, 0, ResultBusy},
+		{"phone window microphone", func(c *sim.Config) { c.Flags = 0x13 }, OpPairPhone, 0, ResultBusy},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := sim.Default()
@@ -215,3 +219,46 @@ type failingSetDevice struct {
 }
 
 func (d *failingSetDevice) Set([hid.ReportSize]byte) error { return d.err }
+
+// Only what the firmware itself refuses is refused locally: A2DP streaming alone does not stop
+// pairing, and a connected phone does not stop the phone window.
+func TestControlValidationFollowsTheFirmware(t *testing.T) {
+	for _, tc := range []struct {
+		flags  byte
+		opcode byte
+	}{{0x07, OpPair}, {0x0b, OpPairPhone}, {0x07, OpPairPhone}} {
+		cfg := sim.Default()
+		cfg.Flags = tc.flags
+		client, device := newClient(cfg)
+		if err := client.Command(tc.opcode, 0); err != nil || len(device.Controls()) != 1 {
+			t.Errorf("flags %#x opcode %d: %v", tc.flags, tc.opcode, err)
+		}
+	}
+}
+
+// Pairing answers busy also when it failed after dropping the AirPods and clearing their pair,
+// so a busy receipt for pair is Unconfirmed; its other refusals stay plain.
+func TestPairBusyReceiptIsUnconfirmed(t *testing.T) {
+	cfg := sim.Default()
+	cfg.ControlResults = map[byte]byte{OpPair: ResultBusy}
+	client, _ := newClient(cfg)
+	err := client.Pair()
+	var unconfirmed *Unconfirmed
+	var refused *ControlRejected
+	if !errors.As(err, &unconfirmed) || !errors.As(err, &refused) || refused.Result != ResultBusy ||
+		!strings.Contains(err.Error(), "may already have disconnected the AirPods and erased their pairing") {
+		t.Fatalf("busy: %v", err)
+	}
+	for result := ResultStale; result <= ResultMalformed; result++ {
+		cfg.ControlResults = map[byte]byte{OpPair: result}
+		client, _ := newClient(cfg)
+		if err := client.Pair(); errors.As(err, &unconfirmed) || !errors.As(err, &refused) || refused.Result != result {
+			t.Errorf("result %d: %v", result, err)
+		}
+	}
+	cfg.ControlResults = map[byte]byte{OpPairPhone: ResultBusy}
+	client, _ = newClient(cfg)
+	if err := client.PairPhone(); errors.As(err, &unconfirmed) || !errors.As(err, &refused) {
+		t.Errorf("phone window busy: %v", err)
+	}
+}

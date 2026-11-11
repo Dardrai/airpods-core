@@ -1,6 +1,7 @@
 package dongle
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/Dardrai/airpods-core/dongle/sim"
@@ -56,8 +57,17 @@ func TestCachedSlots(t *testing.T) {
 	if got, err := client.Cached(SlotHearingAid); got != nil || err != nil {
 		t.Errorf("empty slot: %+v %v", got, err)
 	}
-	if _, err := client.Cached(6); err == nil {
-		t.Error("unknown slot")
+	// Slot 6 answers with the settings snapshot, not a kept report, and 8 is past the last slot.
+	for _, slot := range []byte{0, 6, 8} {
+		if _, err := client.Cached(slot); err == nil {
+			t.Errorf("slot %d read", slot)
+		}
+	}
+	eq := []byte{4, 0, 4, 0, 0x63, 0, 5, 0, 1, 1, 30, 50, 70}
+	cfg.Cached[SlotEQ] = sim.CachedReport{Age: 3, Revision: 9, Packet: eq}
+	client = NewClient(sim.New(cfg))
+	if got, err := client.Cached(SlotEQ); err != nil || got == nil || got.Revision != 9 || !bytes.Equal(got.Packet, eq) {
+		t.Errorf("EQ slot: %+v %v", got, err)
 	}
 	if _, err := DecodeCached(make([]byte, 8)); err == nil {
 		t.Error("short envelope")

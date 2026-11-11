@@ -72,7 +72,14 @@ func validateCommand(status Status, opcode, arg byte) error {
 	if opcode == OpListeningMode && !status.ControlsReady {
 		return reject(ResultDisconnected)
 	}
-	if opcode == OpPair && (status.USBPlayback || status.MicrophoneActive || status.PhoneConnected) {
+	// The firmware's own busy checks that the status shows: pair refuses USB playback, the AirPods
+	// microphone and a phone relay; the phone window refuses USB playback and the microphone.
+	// Their other causes (a microphone requested but not yet active, a settings lease, a request
+	// in flight) only show in the receipt.
+	switch {
+	case opcode == OpPair && (status.USBPlayback || status.MicrophoneActive || status.PhoneConnected):
+		return reject(ResultBusy)
+	case opcode == OpPairPhone && (status.USBPlayback || status.MicrophoneActive):
 		return reject(ResultBusy)
 	}
 	return nil
@@ -147,7 +154,16 @@ func (c *Client) Command(opcode, arg byte) error {
 			if report.ReceiptResult == ResultOK {
 				return nil
 			}
-			return &ControlRejected{Opcode: opcode, Result: report.ReceiptResult}
+			rejected := &ControlRejected{Opcode: opcode, Result: report.ReceiptResult}
+			if opcode == OpPair && report.ReceiptResult == ResultBusy {
+				// Pairing also answers busy when it fails after dropping the AirPods and
+				// clearing their saved pair, so busy is no proof that nothing changed.
+				return &Unconfirmed{
+					Message: "pair: the dongle answered busy, but it may already have disconnected the AirPods and erased their pairing; check status before retrying.",
+					Err:     rejected,
+				}
+			}
+			return rejected
 		}
 		_ = sleepContext(c.ctx, c.clock, controlPoll) // An ended context is seen at the top.
 	}
@@ -158,7 +174,8 @@ func (c *Client) Command(opcode, arg byte) error {
 // this is the same bounded takeover as a button press, and it ends a routing release.
 func (c *Client) Reconnect() error { return c.Command(OpReconnect, 0) }
 
-// Pair puts the dongle in AirPods pairing (opcode 2); refused while audio is in use.
+// Pair puts the dongle in AirPods pairing (opcode 2); refused while audio, the AirPods
+// microphone or a phone is in use. A busy receipt is Unconfirmed: the pairing may be erased.
 func (c *Client) Pair() error { return c.Command(OpPair, 0) }
 
 // SetListeningMode switches listening mode through opcode 3 (ListeningANC or

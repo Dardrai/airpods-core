@@ -19,7 +19,9 @@ It is pure Go and depends only on `golang.org/x/sys`.
 ## Dongle firmware
 
 The protocol is the one documented by the [dongle firmware](https://github.com/Ripthulhu/airpods-dongle),
-in its `docs/USB-CONTROL.md` and `docs/CONTROL-EXTENSIONS.md`. The library follows firmware 0.1.62.
+in its `docs/USB-CONTROL.md` and `docs/CONTROL-EXTENSIONS.md`. The library follows firmware 0.1.66.
+Nothing in the status report tells firmware versions from 0.1.62 on apart; the newer requests below
+are recognised by how the dongle answers them.
 
 Each dongle lists what it can do in the capability bits of its status report. `dongle.CapabilityNames`
 names them:
@@ -40,16 +42,38 @@ names them:
 Connections: since firmware 0.1.58 the dongle no longer connects to the AirPods on its own after a link
 loss or at startup. An outgoing connection needs a button press, a reconnect (opcode 1) or a routing
 acquire. Incoming connections from the saved pair are still accepted, so the AirPods can still
-connect on their own.
+connect on their own. Since 0.1.63 this holds only under the Manual reconnect policy, the default.
+
+Reconnect policy: firmware 0.1.63 and newer keep a reconnect policy across restarts,
+`dongle.ReconnectManual` or `dongle.ReconnectAutomatic`. Under Automatic the dongle retries the saved
+pair by itself, with growing pauses, while the AirPods are not connected and not released. That can
+take them from another device using them, and every attempt moves the routing revision.
+`Client.ReconnectPolicy` reads the policy at any time. `Client.SetReconnectPolicy` reads it first and
+sends nothing when it is already saved. The dongle saves only while idle: not during playback,
+microphone use, connecting or a Game Mode change, and not while any app holds the settings lease,
+the caller included. A save the dongle could not verify is `Unconfirmed`, since it may have
+persisted, and is never retried. The policy then reads as unsupported until a later save verifies
+or the dongle restarts. Older firmware, or a saved policy the dongle cannot read, answers unsupported.
 
 Disconnecting: `disconnect` releases the AirPods through the routing handover and keeps them paired.
 It reads the routing state, sends one release quoting its revision and a fresh nonce, and waits up to
 5 s for the dongle to close the connection. A release accepted but not closed by then is reported as
-pending, not as an error. If another choice moved the routing intent first, nothing is sent again. The
-dongle refuses a release while the microphone or a call is in use, during a takeover, an audio change or
-a Game Mode change, and while any app holds the settings lease. After a release it declines the AirPods'
-incoming connections until a reconnect, a button press or an acquire. Firmware without the `routing`
-bit has no way to disconnect while keeping the pairing; the pair command erases it and is never used.
+pending, not as an error. A release counts as done once the AirPods are released and their audio and
+controls are closed; an acquire once the dongle owns the AirPods with audio and controls up and
+nothing pending. While it waits, a routing read that no longer carries the request's revision, action
+and nonce means another choice replaced it. If the revision moved before the request arrived, nothing
+was applied. The library then reads the routing state once and sends one fresh request, but only when
+the move was a takeover intent (a reconnect, a button press or an automatic attempt) that has ended.
+Another app's handover is reported as a changed intent. An acquire follows a takeover already under way
+instead. The dongle refuses a release while the microphone or a call is in use, during a takeover, an
+audio change or a Game Mode change, and while any app holds the settings lease. After a release it
+declines the AirPods' incoming connections until a reconnect, a button press, an acquire or a restart
+of the dongle. Under the Automatic policy a restarted dongle then takes the AirPods back by itself.
+Firmware without the `routing` bit has no way to disconnect while keeping the pairing; the pair
+command erases it and is never used.
+
+Pairing: the dongle can answer a pair request (opcode 2) as busy after it has already dropped the
+AirPods and cleared their pairing, so `Client.Pair` reports a busy answer as `Unconfirmed`.
 
 Allow Off: the dongle forgets an Allow Off write whenever the AirPods connect again. For AirPods Pro 3,
 which never report Allow Off, it then refuses mode off and hold modes with off until Allow Off is sent
@@ -57,6 +81,25 @@ again. `model.View.NeedsAllowOffResend` says when a write needs that first.
 
 Settings arrive one by one after the AirPods connect, so the first settings read can be partial. A read
 refused because the AirPods controls are not ready yet is an `Unsupported` that also matches `dongle.ErrNotReady`.
+
+Firmware 0.1.64 added two settings, `en352-protection` (AirPods Pro 3) and `gain-swipe` (AirPods Pro 2
+and 3), both on/off. They appear only in the extended settings snapshot, which `SettingsClient.Read`
+asks for. Older firmware calls that request malformed; the client then falls back to the original
+snapshot and does not ask again. The dongle writes either setting only once the AirPods have reported it.
+
+Ear detection and Conversation Awareness: since firmware 0.1.65 the dongle acts on these by itself.
+While it plays music from USB it pauses when a bud comes out and, if it made that pause, plays again
+when the bud goes back in, through the ordinary media keys of its USB interface. When Conversation Awareness starts, it lowers
+the music it sends to the AirPods. A host cannot see this happen, cannot tell from the dongle whether
+its firmware does it, and cannot switch it off on the dongle. The only switches are the AirPods'
+own `ear-detection` and `conversation-awareness` settings.
+
+Hearing: firmware 0.1.64 and newer keep the AirPods' last EQ report and pass an EQ change on only
+while they know the model and hold that report. `hearing.ExperimentalSetEQ` changes the report's
+values and counts as done only when a new EQ report carries exactly the values sent. Loud Sound
+Reduction (AirPods Pro 2 and 3) is found by discovery in every request, never at a fixed handle.
+Writing the hearing profile needs hearing assistance set up on the AirPods and leaves Hearing Aid
+as it is. Headphone Accommodations and its presets are not supported.
 
 ## Credits
 

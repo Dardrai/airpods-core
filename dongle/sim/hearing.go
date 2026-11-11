@@ -4,13 +4,14 @@ import (
 	"bytes"
 	"encoding/binary"
 	"math"
+	"slices"
 )
 
 // More simulated attribute UUIDs, in wire order.
 var (
 	UUIDTransparency = printedUUID(0xd5621cc1, [12]byte{0xf7, 0xab, 0x45, 0xdb, 0x94, 0x03, 0x9e, 0xaf, 0x74, 0x4d, 0x53, 0x90})
-	// UUIDLoudSound stands in for the attribute at the fixed Loud Sound Reduction handle.
-	UUIDLoudSound = printedUUID(0xa41200ff, ahpsSuffix)
+	// UUIDLoudSound is Loud Sound Reduction, a48fec08-3921-43db-82aa-afbce8ebb4fb.
+	UUIDLoudSound = printedUUID(0xa48fec08, [12]byte{0x39, 0x21, 0x43, 0xdb, 0x82, 0xaa, 0xaf, 0xbc, 0xe8, 0xeb, 0xb4, 0xfb})
 )
 
 // Value offsets the simulated records share.
@@ -43,7 +44,7 @@ func HearingRecord() []byte {
 	return value
 }
 
-// TransparencyRecord builds a 104 byte Custom Transparency record.
+// TransparencyRecord builds a 104 byte Custom Transparency record, the form with Own Voice.
 func TransparencyRecord(enabled bool) []byte {
 	value := make([]byte, 104)
 	put := func(offset int, v float32) { binary.LittleEndian.PutUint32(value[offset:], math.Float32bits(v)) }
@@ -60,6 +61,22 @@ func TransparencyRecord(enabled bool) []byte {
 	put(96, 0.25)
 	put(recordOwnVoice, 0.875)
 	return value
+}
+
+// ShortTransparencyRecord builds the 100 byte Custom Transparency record, which has no Own Voice.
+func ShortTransparencyRecord(enabled bool) []byte { return TransparencyRecord(enabled)[:100] }
+
+// UnsetTransparencyRecord is the 4 byte record of AirPods that never had Custom Transparency set
+// up. It counts as off.
+func UnsetTransparencyRecord() []byte { return []byte{2, 0, 0, 0} }
+
+// EQReport builds the AirPods' 13 byte EQ report: on or off, then the low, mid and high bands.
+func EQReport(on bool, low, mid, high byte) []byte {
+	state := byte(1)
+	if on {
+		state = 2
+	}
+	return []byte{4, 0, 4, 0, 0x63, 0, 5, 0, 1, state, low, mid, high}
 }
 
 // PMERecord builds a 140 byte media assist record with both enable flags off.
@@ -93,22 +110,27 @@ type HearingAirPods struct {
 	Requests int
 	// BeforeExchange runs before each ATT request is answered.
 	BeforeExchange func(pdu []byte)
+	// AfterAAP runs after each AAP packet has been taken and reported, for AirPods that answer
+	// with more than the packet itself.
+	AfterAAP func(pdu []byte)
 }
 
-// NewHearingAirPods builds a pair reporting a model and firmware.
+// NewHearingAirPods builds a pair reporting a model and firmware, with EQ off at 30, 50 and 70.
+// Loud Sound Reduction sits at handle 0x23, so only discovery finds it.
 func NewHearingAirPods(model, firmware string) *HearingAirPods {
 	server := NewAirPodsServer()
 	server.Attributes = append(server.Attributes,
-		&Attribute{UUID: UUIDLoudSound, Props: 0x0a, Handle: 0x1b, Value: []byte{0}},
 		&Attribute{UUID: UUIDCheck, Props: 0x08, Handle: 0x1d, Value: []byte{0}},
 		&Attribute{UUID: UUIDHearing, Props: 0x0a, Handle: 0x1f, Value: HearingRecord()},
-		&Attribute{UUID: UUIDTransparency, Props: 0x0a, Handle: 0x21, Value: TransparencyRecord(false)})
+		&Attribute{UUID: UUIDTransparency, Props: 0x0a, Handle: 0x21, Value: TransparencyRecord(false)},
+		&Attribute{UUID: UUIDLoudSound, Props: 0x0a, Handle: 0x23, Value: []byte{0}})
 	a := &HearingAirPods{Server: server, Slots: map[byte]CachedReport{}}
 	a.Slots[1] = CachedReport{Age: 1000, Revision: 1, Packet: Metadata(model, firmware, "SIMSERIAL123")}
 	a.Slots[2] = CachedReport{Age: 1000, Revision: 1, Packet: []byte{4, 0, 4, 0, 9, 0, 0x2c, 1, 2, 0, 0}}
 	a.Slots[3] = CachedReport{Age: 1000, Revision: 1, Packet: []byte{4, 0, 4, 0, 9, 0, 0x33, 2, 0, 0, 0}}
 	a.Slots[4] = CachedReport{Age: 1000, Revision: 1, Packet: PMERecord()}
 	a.Slots[5] = CachedReport{Age: 1000, Revision: 1, Packet: EarPacket(2, 2)}
+	a.Slots[7] = CachedReport{Age: 1000, Revision: 1, Packet: EQReport(false, 30, 50, 70)}
 	return a
 }
 
@@ -149,18 +171,56 @@ func (a *HearingAirPods) onAAP(pdu []byte) {
 		slot = 3
 	case pdu[4] == 0x53:
 		slot = 4
+	case pdu[4] == 0x63:
+		slot = 7
 	}
-	if slot != 0 && !a.Silent && !a.SilentSlots[slot] {
+	switch {
+	case slot == 0 || a.Silent || a.SilentSlots[slot]:
+	case slot == 7 && !validEQ(pdu):
+		delete(a.Slots, 7) // The dongle keeps only a valid EQ report.
+	default:
 		a.Report(slot, pdu)
 	}
+	if a.AfterAAP != nil {
+		a.AfterAAP(pdu)
+	}
+}
+
+func validEQ(p []byte) bool {
+	return len(p) == 13 && bytes.Equal(p[:9], []byte{4, 0, 4, 0, 0x63, 0, 5, 0, 1}) &&
+		(p[9] == 1 || p[9] == 2) && p[10] <= 100 && p[11] <= 100 && p[12] <= 100
+}
+
+// firmwareModels are the model numbers the dongle firmware knows; it passes EQ on only for these.
+var firmwareModels = []string{
+	"A1523", "A1722", "A2032", "A2031", "A2565", "A2564", "A3053", "A3050", "A3054", "A3056", "A3055",
+	"A3057", "A3531", "A3532", "A3533", "A3439", "A3440", "A3441", "A2084", "A2083", "A2931", "A2699",
+	"A2698", "A3047", "A3048", "A3049", "A3063", "A3064", "A3065", "A2096", "A3184", "A3454", "A3157",
+}
+
+// knownModel reports whether the kept information report names a model the firmware knows.
+func knownModel(packet []byte) bool {
+	if len(packet) < 11 || !bytes.Equal(packet[:6], []byte{4, 0, 4, 0, 0x1d, 0}) {
+		return false
+	}
+	fields := bytes.Split(packet[11:], []byte{0})
+	return len(fields) > 1 && slices.Contains(firmwareModels, string(fields[1]))
 }
 
 var requestNotifications = []byte{4, 0, 4, 0, 0x0f, 0, 0xff, 0xff, 0xff, 0xff}
 
 // aapAllowed is the dongle's fixed list of AAP packets a host may send: the hearing and
-// assist switches, ANC or transparency, the media assist record, the report request and
-// the host clock. Anything else is refused without being sent.
-func aapAllowed(p []byte) bool {
+// assist switches, ANC or transparency, the media assist record, the report request, the
+// host clock and EQ. EQ passes only while the dongle knows the model and keeps a valid EQ
+// report. Anything else is refused without being sent.
+func (d *Device) aapAllowed(p []byte) bool {
+	if len(p) >= 6 && p[4] == 0x63 {
+		return validEQ(p) && p[5] == 0 && knownModel(d.cfg.Cached[1].Packet) && validEQ(d.cfg.Cached[7].Packet)
+	}
+	return aapListed(p)
+}
+
+func aapListed(p []byte) bool {
 	n := len(p)
 	if n < 6 || n > 512 || !bytes.Equal(p[:4], []byte{4, 0, 4, 0}) || p[5] != 0 {
 		return false

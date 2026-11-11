@@ -1,7 +1,9 @@
 package sim
 
 import (
+	"bytes"
 	"encoding/binary"
+	"fmt"
 	"testing"
 
 	"github.com/Dardrai/airpods-core/hid"
@@ -272,8 +274,12 @@ func TestCachedSlotSixIsTheSettingsSnapshot(t *testing.T) {
 	if reply := commitTyped(t, d, 3, 2, 6); reply[21] != 3 || binary.LittleEndian.Uint16(reply[16:]) != 0 {
 		t.Fatalf("not ready: % x", reply[:24])
 	}
-	if reply := commitTyped(t, d, 3, 3, 7); reply[21] != 4 || reply[22] != 1 {
+	// Slot 7 is the EQ report, empty here; past it the dongle answers unsupported.
+	if reply := commitTyped(t, d, 3, 3, 7); reply[21] != 3 || binary.LittleEndian.Uint16(reply[16:]) != 0 {
 		t.Fatalf("slot 7: % x", reply[:24])
+	}
+	if reply := commitTyped(t, d, 3, 4, 8); reply[21] != 4 || reply[22] != 7 {
+		t.Fatalf("slot 8: % x", reply[:24])
 	}
 }
 
@@ -294,14 +300,153 @@ func TestAAPOutsideTheListIsRefused(t *testing.T) {
 		{"report request", requestNotifications, true},
 		{"host clock", clock, true},
 		{"host clock in a zone", append(append([]byte(nil), clock[:35]...), "+01:00"...), false},
-		{"eq", []byte{4, 0, 4, 0, 0x63, 0, 5, 0, 1, 2, 10, 50, 100}, false},
 		{"rename", []byte{4, 0, 4, 0, 0x1a, 0, 1, 4, 0, 'A', 'l', 'e', 'x'}, false},
 	} {
-		if got := aapAllowed(tc.packet); got != tc.allowed {
+		if got := aapListed(tc.packet); got != tc.allowed {
 			t.Errorf("%s: %v", tc.name, got)
 		}
 	}
 	if len(clock) != 41 {
 		t.Fatalf("clock is %d bytes", len(clock))
+	}
+}
+
+func newerSettings() Config {
+	cfg := Default()
+	cfg.Settings = append(cfg.Settings, Setting{Control: 0x37, Revision: 1, Value: 1}, Setting{Control: 0x2f, Revision: 1, Value: 2})
+	return cfg
+}
+
+// count is the record count of a snapshot reply, or the failure code.
+func count(reply [hid.ReportSize]byte) (byte, byte) {
+	if reply[21] == 4 {
+		return 0, reply[22]
+	}
+	return reply[23], 0
+}
+
+func TestSnapshotSelector(t *testing.T) {
+	d := New(newerSettings())
+	for i, tc := range []struct {
+		payload []byte
+		records byte
+		code    byte
+	}{
+		{[]byte{7, 2}, 4, 0}, // the legacy snapshot leaves the newer settings out
+		{[]byte{7, 2, 1}, 6, 0},
+		{[]byte{7, 2, 2}, 0, 1},
+		{[]byte{7, 2, 1, 0}, 0, 1},
+		{[]byte{3, 6}, 4, 0}, // slot 6 is the legacy snapshot
+	} {
+		records, code := count(commitTyped(t, d, tc.payload[0], uint32(i+1), tc.payload[1:]...))
+		if records != tc.records || code != tc.code {
+			t.Errorf("% x: %d records, code %d", tc.payload, records, code)
+		}
+	}
+	cfg := newerSettings()
+	cfg.LegacySnapshotOnly = true
+	d = New(cfg)
+	if _, code := count(commitTyped(t, d, 7, 1, 2, 1)); code != 1 {
+		t.Errorf("old firmware: code %d", code)
+	}
+	if records, _ := count(commitTyped(t, d, 7, 2, 2)); records != 4 {
+		t.Errorf("old firmware legacy: %d", records)
+	}
+}
+
+func TestNewSettingsWriteGate(t *testing.T) {
+	d := New(Default())
+	if reply := commitTyped(t, d, 7, 1, 1, 0x2f, 1, 0, 0, 0); reply[21] != 4 || reply[22] != 7 {
+		t.Errorf("unreported: % x", reply[20:24])
+	}
+	d = New(newerSettings())
+	if reply := commitTyped(t, d, 7, 1, 1, 0x37, 2, 0, 0, 0); reply[21] != 3 || d.Writes() != 1 {
+		t.Errorf("reported: % x", reply[20:24])
+	}
+}
+
+func TestReconnectPolicyKind(t *testing.T) {
+	d := New(Default())
+	for i, tc := range []struct {
+		payload []byte
+		reply   []byte
+		code    byte
+	}{
+		{[]byte{23}, []byte{1, 0}, 0},
+		{[]byte{23, 1}, []byte{1, 1}, 0},
+		{[]byte{23}, []byte{1, 1}, 0},
+		{[]byte{23, 2}, nil, 1},
+		{[]byte{23, 0, 0}, nil, 1},
+	} {
+		reply := commitTyped(t, d, 7, uint32(i+1), tc.payload...)
+		if tc.code != 0 && (reply[21] != 4 || reply[22] != tc.code) || tc.code == 0 && (reply[21] != 3 || string(reply[22:24]) != string(tc.reply)) {
+			t.Errorf("% x: % x", tc.payload, reply[20:25])
+		}
+	}
+	d.leaseHeld = true
+	if reply := commitTyped(t, d, 7, 9, 23, 0); reply[22] != 2 {
+		t.Errorf("save under a lease: % x", reply[20:25])
+	}
+	if reply := commitTyped(t, d, 7, 10, 23); reply[21] != 3 || reply[23] != 1 {
+		t.Errorf("read under a lease: % x", reply[20:25])
+	}
+}
+
+// Under the Automatic policy, with the AirPods away, every routing read is followed by an
+// automatic attempt that moves the revision, and none while that attempt is under way.
+func TestAutomaticPolicyMovesTheRoutingRevision(t *testing.T) {
+	cfg := Default()
+	cfg.Flags = 0
+	cfg.RoutingTakeoverDelay = 1
+	for _, policy := range []byte{0, 1} {
+		cfg.ReconnectPolicy = policy
+		d := New(cfg)
+		var revisions []uint32
+		var flags []byte
+		for i := range 3 { // the third read connects, which starts a new generation
+			reply := commitTyped(t, d, 7, uint32(i+1), 20)
+			revisions = append(revisions, binary.LittleEndian.Uint32(reply[26:]))
+			flags = append(flags, reply[24])
+		}
+		want := "[1 1 1] [0 0 0]"
+		if policy == 1 {
+			want = "[1 2 2] [0 4 99]" // pending, then connected and owned: 0x63
+		}
+		if got := fmt.Sprint(revisions, flags); got != want {
+			t.Errorf("policy %d: %s", policy, got)
+		}
+	}
+}
+
+// EQ passes only as a valid packet, while the dongle knows the model and keeps a valid EQ report.
+func TestEQNeedsAKnownModelAndAKeptReport(t *testing.T) {
+	eq := EQReport(true, 10, 50, 100)
+	for _, tc := range []struct {
+		name    string
+		change  func(*HearingAirPods)
+		packet  []byte
+		allowed bool
+	}{
+		{"valid", func(*HearingAirPods) {}, eq, true},
+		{"band over 100", func(*HearingAirPods) {}, EQReport(true, 10, 101, 0), false},
+		{"state 0", func(*HearingAirPods) {}, append(append([]byte(nil), eq[:9]...), 0, 1, 1, 1), false},
+		{"long", func(*HearingAirPods) {}, append(append([]byte(nil), eq...), 0), false},
+		{"unknown model", func(a *HearingAirPods) {
+			a.Slots[1] = CachedReport{Revision: 1, Packet: Metadata("A9999", "9A348", "S")}
+		}, eq, false},
+		{"no model report", func(a *HearingAirPods) { delete(a.Slots, 1) }, eq, false},
+		{"no EQ report", func(a *HearingAirPods) { delete(a.Slots, 7) }, eq, false},
+	} {
+		a := NewHearingAirPods("A3063", "9A348")
+		tc.change(a)
+		d := New(a.Config())
+		if got := d.aapAllowed(tc.packet); got != tc.allowed {
+			t.Errorf("%s: %v", tc.name, got)
+		}
+	}
+	a := NewHearingAirPods("A3063", "9A348")
+	a.onAAP(eq)
+	if report := a.Slots[7]; report.Revision != 2 || !bytes.Equal(report.Packet, eq) {
+		t.Errorf("an accepted EQ write must publish a new report: %+v", report)
 	}
 }

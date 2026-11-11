@@ -255,11 +255,189 @@ func TestAcquire(t *testing.T) {
 	}
 
 	cfg := sim.Default()
+	cfg.Flags = 0
 	cfg.RoutingTakeoverDelay = 1000
 	_, client, _ = connect(t, cfg)
 	if outcome, err := Acquire(client); err != nil || outcome != AcquirePending {
 		t.Errorf("slow takeover: %v %v", outcome, err)
 	}
+}
+
+func TestAcquireWhenOwnedSendsNothing(t *testing.T) {
+	device, client, _ := connect(t, sim.Default())
+	if outcome, err := Acquire(client); err != nil || outcome != Acquired || len(handovers(device)) != 0 {
+		t.Errorf("Acquire() = %v %v, %d handovers", outcome, err, len(handovers(device)))
+	}
+}
+
+// Ownership alone is not a finished takeover: audio and controls must be up too.
+func TestAcquireNeedsTheWholeOwningState(t *testing.T) {
+	cfg := sim.Default()
+	cfg.Flags = 0x01 // connected, controls not ready
+	device, client, _ := connect(t, cfg)
+	if r, _ := client.Routing(); !r.Has(dongle.RoutingOwned) || acquired(r) {
+		t.Fatalf("flags %#x", r.Flags)
+	}
+	if outcome, err := Acquire(client); err != nil || outcome != AcquirePending || len(handovers(device)) != 1 {
+		t.Errorf("Acquire() = %v %v, %d handovers", outcome, err, len(handovers(device)))
+	}
+}
+
+func TestReleaseNeedsTheWholeReleasedState(t *testing.T) {
+	routing := func(flags byte) sim.Hex {
+		reply := make([]byte, 32)
+		reply[0], reply[1], reply[2], reply[4] = 1, 32, flags, 1
+		return reply
+	}
+	for _, tc := range []struct {
+		flags byte
+		want  Outcome
+	}{
+		{0x08, Released},
+		{0x89, Released},       // whether the AirPods said who owns them and microphone use do not count
+		{0x48, ReleasePending}, // released, but the AirPods controls are still up
+	} {
+		cfg := sim.Default()
+		cfg.Replies = map[byte]sim.Hex{20: routing(tc.flags)}
+		device, client, status := connect(t, cfg)
+		if outcome, err := Pick(client, status).Disconnect(); err != nil || outcome != tc.want || len(handovers(device)) != 0 {
+			t.Errorf("flags %#x: %v %v, %d handovers", tc.flags, outcome, err, len(handovers(device)))
+		}
+	}
+}
+
+// injectOnHandover runs inject just before a handover request reaches the dongle, a set
+// number of times: another choice made between the routing read and the send.
+type injectOnHandover struct {
+	*sim.Device
+	inject func()
+	times  int
+}
+
+func (d *injectOnHandover) Set(data [hid.ReportSize]byte) error {
+	if data[0] == 3 && data[7] == 7 && data[22] == 21 && d.times > 0 {
+		d.times--
+		d.inject()
+	}
+	return d.Device.Set(data)
+}
+
+// stalePair is a client whose first handovers each meet a choice made through another client.
+func stalePair(t *testing.T, cfg sim.Config, times int, choose func(other *dongle.Client)) (*sim.Device, *dongle.Client, dongle.Status) {
+	t.Helper()
+	device := sim.New(cfg)
+	other := dongle.NewClient(device)
+	other.SetClock(sim.NewVirtualClock())
+	client := dongle.NewClient(&injectOnHandover{device, func() { choose(other) }, times})
+	client.SetClock(sim.NewVirtualClock())
+	status, err := client.Status()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return device, client, status
+}
+
+func reconnect(other *dongle.Client) { _ = other.Reconnect() }
+
+// A reconnect or an automatic attempt between the read and the send makes the request stale;
+// nothing was applied, so one fresh request goes out, and only one.
+func TestStaleFromATakeoverIntentGetsOneFreshRequest(t *testing.T) {
+	device, client, status := stalePair(t, sim.Default(), 1, reconnect)
+	if outcome, err := Pick(client, status).Disconnect(); err != nil || outcome != Released {
+		t.Fatalf("Disconnect() = %v, %v", outcome, err)
+	}
+	sent := handovers(device)
+	if len(sent) != 2 || binary.LittleEndian.Uint32(sent[0][2:]) != 1 || binary.LittleEndian.Uint32(sent[1][2:]) != 2 {
+		t.Fatalf("handovers % x", sent)
+	}
+
+	device, client, status = stalePair(t, sim.Default(), 2, reconnect)
+	_, err := Pick(client, status).Disconnect()
+	if !errors.Is(err, ErrIntentChanged) || !strings.HasPrefix(err.Error(), "routing intent changed again during one fresh request; read status again (now owned by the dongle)") {
+		t.Fatalf("stale twice: %v", err)
+	}
+	if n := len(handovers(device)); n != 2 {
+		t.Errorf("sent %d handovers", n)
+	}
+}
+
+// Another app's accepted handover is its choice: it is not overridden, unless it already
+// reached what this request wanted.
+func TestStaleFromAnotherHandoverIsNotRetried(t *testing.T) {
+	release := func(other *dongle.Client) {
+		r, _ := other.Routing()
+		if _, err := other.Handover(dongle.HandoverRelease, r.Revision, 4242); err != nil {
+			t.Error(err)
+		}
+	}
+	away := sim.Default()
+	away.Flags = 0
+	device, client, _ := stalePair(t, away, 1, release)
+	_, err := Acquire(client)
+	if !errors.Is(err, ErrIntentChanged) || !strings.Contains(err.Error(), "now released") {
+		t.Fatalf("Acquire() = %v", err)
+	}
+	if n := len(handovers(device)); n != 2 {
+		t.Errorf("%d handovers, want the other app's and one", n)
+	}
+	device, client, status := stalePair(t, away, 1, release)
+	if outcome, err := Pick(client, status).Disconnect(); err != nil || outcome != Released || len(handovers(device)) != 2 {
+		t.Fatalf("Disconnect() = %v %v, %d handovers", outcome, err, len(handovers(device)))
+	}
+}
+
+// automatic is a dongle away from its AirPods under the Automatic reconnect policy: right after
+// each routing read it starts a takeover, so the revision just read is already stale.
+func automatic(takeoverDelay int) sim.Config {
+	cfg := sim.Default()
+	cfg.Flags = 0
+	cfg.ReconnectPolicy = 1
+	cfg.RoutingTakeoverDelay = takeoverDelay
+	return cfg
+}
+
+func TestStaleUnderTheAutomaticPolicy(t *testing.T) {
+	// The dongle would refuse a release as busy until its own takeover ends.
+	device, client, status := connect(t, automatic(1000))
+	_, err := Pick(client, status).Disconnect()
+	if !errors.Is(err, ErrIntentChanged) || !strings.Contains(err.Error(), "now takeover pending") || len(handovers(device)) != 1 {
+		t.Fatalf("release: %v, %d handovers", err, len(handovers(device)))
+	}
+	// An acquire follows the dongle's own takeover instead of sending another.
+	device, client, _ = connect(t, automatic(3))
+	if outcome, err := Acquire(client); err != nil || outcome != Acquired || len(handovers(device)) != 1 {
+		t.Fatalf("acquire: %v %v, %d handovers", outcome, err, len(handovers(device)))
+	}
+	device, client, _ = connect(t, automatic(1000))
+	if outcome, err := Acquire(client); err != nil || outcome != AcquirePending || len(handovers(device)) != 1 {
+		t.Fatalf("slow acquire: %v %v, %d handovers", outcome, err, len(handovers(device)))
+	}
+}
+
+// A reconnect while the release closes replaces it.
+func TestReplacedReleaseIsIntentChanged(t *testing.T) {
+	cfg := sim.Default()
+	cfg.RoutingCloseDelay = 1000
+	device := sim.New(cfg)
+	other := dongle.NewClient(device)
+	other.SetClock(sim.NewVirtualClock())
+	client := dongle.NewClient(device)
+	client.SetClock(reconnectOnSleep{sim.NewVirtualClock(), other})
+	status, _ := client.Status()
+	_, err := Pick(client, status).Disconnect()
+	if !errors.Is(err, ErrIntentChanged) || len(handovers(device)) != 1 {
+		t.Fatalf("Disconnect() = %v, %d handovers", err, len(handovers(device)))
+	}
+}
+
+type reconnectOnSleep struct {
+	*sim.VirtualClock
+	other *dongle.Client
+}
+
+func (c reconnectOnSleep) Sleep(d time.Duration) {
+	_ = c.other.Reconnect()
+	c.VirtualClock.Sleep(d)
 }
 
 func TestNonceIsFreshAndNonzero(t *testing.T) {

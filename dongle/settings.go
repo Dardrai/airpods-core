@@ -7,6 +7,7 @@ import (
 	"math/bits"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -80,6 +81,8 @@ var Settings = []Setting{
 var ExtraSettings = []Setting{
 	{Name: "connect-automatically", Control: 0x20, Values: toggle},
 	{Name: "allow-auto-connect", Control: 0x36, Values: toggle},
+	{Name: "en352-protection", Control: 0x37, Values: toggle}, // AirPods Pro 3; extended snapshot only
+	{Name: "gain-swipe", Control: 0x2f, Values: toggle},       // AirPods Pro 2 and 3; extended snapshot only
 }
 
 // LookupSetting finds a row of Settings by name.
@@ -286,6 +289,7 @@ type SettingsClient struct {
 	client     *Client
 	status     Status
 	generation uint32
+	legacy     atomic.Bool // the dongle refused the extended snapshot, so only the legacy one is read
 }
 
 // SettingsClient reads the status that pins a settings client to the current generation.
@@ -322,12 +326,29 @@ func (s *SettingsClient) writable() (Status, error) {
 // again to see more. A refusal while the AirPods controls are not ready is an Unsupported
 // that also matches ErrNotReady. A dongle's capabilities are fixed for a generation, so this
 // does not read the status again just to check them.
+//
+// It asks for the extended snapshot (firmware 0.1.64 and newer), which adds en352-protection
+// and gain-swipe. Older firmware calls that request malformed; the client then reads the
+// legacy snapshot, and keeps doing so without asking again.
 func (s *SettingsClient) Read() (map[byte]Record, error) {
 	if s.status.Capabilities&CapTypedRPC == 0 {
 		return nil, errors.New("Firmware does not advertise typed settings support")
 	}
+	if !s.legacy.Load() {
+		values, err := s.snapshot([]byte{2, 1})
+		var rejected *RequestRejected
+		if !errors.As(err, &rejected) || rejected.Code != 1 {
+			return values, err
+		}
+		// Only code 1 means firmware before 0.1.64; code 7 still means controls not ready.
+		s.legacy.Store(true)
+	}
+	return s.snapshot([]byte{2})
+}
+
+func (s *SettingsClient) snapshot(request []byte) (map[byte]Record, error) {
 	generation := s.generation
-	reply, err := s.client.TypedRequest([]byte{2}, &generation)
+	reply, err := s.client.TypedRequest(request, &generation)
 	var unsupported *Unsupported
 	if errors.As(err, &unsupported) {
 		// The dongle refuses the snapshot only before its AirPods controls are ready.

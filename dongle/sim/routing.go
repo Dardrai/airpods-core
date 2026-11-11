@@ -30,7 +30,9 @@ func (d *Device) routingRequest(request []byte) ([]byte, byte) {
 			return nil, 1
 		}
 		d.routingTick()
-		return d.routingSnapshot(), 0
+		snapshot := d.routingSnapshot()
+		d.automaticAttempt()
+		return snapshot, 0
 	}
 	le := binary.LittleEndian
 	if len(request) != 10 || request[1] > 1 || le.Uint32(request[2:]) == 0 || le.Uint32(request[6:]) == 0 {
@@ -72,6 +74,18 @@ func (d *Device) takeoverRequested() {
 		r.released, r.closing = false, false
 		d.connect()
 	}
+}
+
+// automaticAttempt is the Automatic reconnect policy: while the AirPods are not connected and
+// not released, the dongle starts a takeover by itself, which moves the routing revision. It
+// runs right after a routing read, so the revision that read returned is already stale.
+func (d *Device) automaticAttempt() {
+	r := &d.routing
+	if d.cfg.ReconnectPolicy != 1 || d.policyFailed || d.cfg.Flags&1 != 0 || r.released || r.takeover || !d.hasPeer() {
+		return
+	}
+	r.advance(0, 0)
+	r.takeover, r.takeoverIn = true, d.cfg.RoutingTakeoverDelay // A connection takes a while.
 }
 
 func (d *Device) routingTick() {

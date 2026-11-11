@@ -44,7 +44,7 @@ func TestApplyGoldenWriteAndReadback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Settings != requested || result.Enabled {
+	if result.Settings != requested || !result.Written {
 		t.Errorf("result %+v", result)
 	}
 	want := append([]byte{0x12, 0x1f, 0}, sim.HearingRecord()...)
@@ -83,14 +83,14 @@ func TestPatchKeepsUntouchedBytes(t *testing.T) {
 	}
 }
 
-func TestApplyEnablesFirstAndLeavesItOn(t *testing.T) {
+// A fitting write needs hearing assistance set up, not Hearing Aid on, and never turns it on.
+func TestApplyWritesWithHearingAidOffAndLeavesItOff(t *testing.T) {
 	a := proThree()
 	client, dev := rig(t, a)
 	modes := new(Modes)
 	expected := readBaseline(t, client, modes)
-	prepared, err := modes.PrepareProfile(client, expected)
-	if err != nil || !prepared.WillEnable {
-		t.Fatalf("%+v %v", prepared, err)
+	if err := modes.PrepareProfile(client, expected); err != nil {
+		t.Fatal(err)
 	}
 	if a.Server.Writes != 0 || len(a.Received) != 0 {
 		t.Fatal("prepare changed something")
@@ -101,12 +101,28 @@ func TestApplyEnablesFirstAndLeavesItOn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Enabled || result.State.HearingEnabled != FlagOn || a.Server.Writes != 1 {
+	if !result.Written || result.State.HearingEnabled != FlagOff || a.Server.Writes != 1 {
 		t.Errorf("%+v, %d writes", result, a.Server.Writes)
 	}
-	samePackets(t, a.Received, [][]byte{assistOn, hearingOn, ancClean, askReports})
+	if len(a.Received) != 0 {
+		t.Errorf("a profile write sent mode packets: %x", a.Received)
+	}
 	if !strings.Contains(strings.Join(dev.LeaseEvents(), " "), "release") || dev.LeaseHeld() {
 		t.Error("lease kept")
+	}
+}
+
+func TestApplyOfTheStoredValuesWritesNothing(t *testing.T) {
+	a := proThree()
+	client, _ := rig(t, a)
+	modes := new(Modes)
+	expected := readBaseline(t, client, modes)
+	result, err := modes.ApplyProfile(client, expected, expected)
+	if err != nil || result.Written || result.Settings != expected {
+		t.Fatalf("%+v %v", result, err)
+	}
+	if a.Server.Writes != 0 || len(a.Received) != 0 {
+		t.Errorf("%d writes, sent %x", a.Server.Writes, a.Received)
 	}
 }
 
@@ -178,18 +194,28 @@ func TestApplyRefusalsWriteNothing(t *testing.T) {
 		_, err = modes.ApplyProfile(client, profile.Settings, profile.Settings)
 		refused(t, err, "cannot be edited")
 	})
-	t.Run("enable refused leaves off alone", func(t *testing.T) {
-		a := proThree()
-		client, _ := rig(t, a)
-		modes := new(Modes)
-		expected := readBaseline(t, client, modes)
-		a.Server.Find(sim.UUIDTransparency).Value = sim.TransparencyRecord(true)
-		_, err := modes.ApplyProfile(client, expected, expected)
-		refused(t, err, "Custom Transparency")
-		if len(a.Received) != 0 || a.Server.Writes != 0 {
-			t.Errorf("sent %x, %d writes", a.Received, a.Server.Writes)
-		}
-	})
+	for name, report := range map[string][]byte{
+		"not set up":    {4, 0, 4, 0, 9, 0, 0x2c, 2, 0, 0, 0},
+		"state unknown": {4, 0, 4, 0, 9, 0, 0x2c, 2, 1, 0, 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			a := proThree()
+			client, _ := rig(t, a)
+			modes := new(Modes)
+			expected := readBaseline(t, client, modes)
+			a.Report(2, report)
+			if err := modes.PrepareProfile(client, expected); err == nil {
+				t.Error("prepared")
+			}
+			requested := expected
+			requested.OwnVoice = 0.25
+			_, err := modes.ApplyProfile(client, expected, requested)
+			refused(t, err, "iPhone or iPad")
+			if len(a.Received) != 0 || a.Server.Writes != 0 {
+				t.Errorf("sent %x, %d writes", a.Received, a.Server.Writes)
+			}
+		})
+	}
 	t.Run("a new connection needs a new read", func(t *testing.T) {
 		a := enabled()
 		client, dev := rig(t, a)
@@ -315,73 +341,39 @@ func TestReadbackRules(t *testing.T) {
 	})
 }
 
-func TestFailedWriteAfterEnableTurnsItBackOff(t *testing.T) {
-	a := proThree()
-	attribute := a.Server.Find(sim.UUIDHearing)
-	attribute.OnWrite = func(value []byte) {
-		other := bytes.Clone(value)
-		putFloat(other, offLeftEQ, 80)
-		attribute.Value = other
-	}
-	client, _ := rig(t, a)
-	modes := new(Modes)
-	expected := readBaseline(t, client, modes)
-	requested := expected
-	requested.OwnVoice = 0.25
-	_, err := modes.ApplyProfile(client, expected, requested)
-	var u *dongle.Unconfirmed
-	if !errors.As(err, &u) || !strings.Contains(err.Error(), "confirmed off again") {
-		t.Fatalf("err %#v", err)
-	}
-	samePackets(t, a.Received, [][]byte{assistOn, hearingOn, ancClean, askReports, assistOff, hearingOff, askReports})
-	if a.Server.Writes != 1 || modes.Recovery() != nil {
-		t.Errorf("writes %d, recovery %+v", a.Server.Writes, modes.Recovery())
-	}
-}
-
-func TestFailedOffAfterEnableSaysItMayBeActive(t *testing.T) {
-	a := proThree()
-	attribute := a.Server.Find(sim.UUIDHearing)
-	attribute.OnWrite = func(value []byte) {
-		other := bytes.Clone(value)
-		putFloat(other, offLeftEQ, 80)
-		attribute.Value = other
-		a.Silent = true
-	}
-	client, _ := rig(t, a)
-	modes := new(Modes)
-	expected := readBaseline(t, client, modes)
-	requested := expected
-	requested.OwnVoice = 0.25
-	_, err := modes.ApplyProfile(client, expected, requested)
-	if err == nil || !strings.Contains(err.Error(), "may still be active") {
-		t.Fatalf("err %v", err)
-	}
-	if modes.Recovery() == nil {
-		t.Error("no recovery offered")
-	}
-}
-
-func TestFailedWriteWhileAlreadyOnLeavesModesAlone(t *testing.T) {
-	a := enabled()
-	client, _ := rig(t, a)
-	modes := new(Modes)
-	expected := readBaseline(t, client, modes)
-	a.Server.RefuseWrites = true
-	if _, err := modes.ApplyProfile(client, expected, expected); err == nil {
-		t.Fatal("refused write accepted")
-	}
-	if len(a.Received) != 0 {
-		t.Errorf("sent %x", a.Received)
+// A failed write leaves the modes alone: there is no enable to undo and nothing to recover.
+func TestFailedWriteLeavesModesAlone(t *testing.T) {
+	for name, a := range map[string]*sim.HearingAirPods{"off": proThree(), "on": enabled()} {
+		t.Run(name, func(t *testing.T) {
+			attribute := a.Server.Find(sim.UUIDHearing)
+			attribute.OnWrite = func(value []byte) {
+				other := bytes.Clone(value)
+				putFloat(other, offLeftEQ, 80)
+				attribute.Value = other
+			}
+			client, _ := rig(t, a)
+			modes := new(Modes)
+			expected := readBaseline(t, client, modes)
+			requested := expected
+			requested.OwnVoice = 0.25
+			_, err := modes.ApplyProfile(client, expected, requested)
+			var u *dongle.Unconfirmed
+			if !errors.As(err, &u) {
+				t.Fatalf("err %#v", err)
+			}
+			if len(a.Received) != 0 || a.Server.Writes != 1 || modes.Recovery() != nil {
+				t.Errorf("sent %x, %d writes, recovery %+v", a.Received, a.Server.Writes, modes.Recovery())
+			}
+		})
 	}
 }
 
 func TestEditMapping(t *testing.T) {
 	base, _ := parseSettings(sim.HearingRecord())
 	edit := NewProfileEdit(Profile{Settings: base, Editable: true})
-	// left 0.25, right -0.25: (0+2)/4 = 0.5; right-left = -0.5.
-	if edit.Amplification != 0.5 || edit.Balance != -0.5 {
-		t.Errorf("sliders %v %v", edit.Amplification, edit.Balance)
+	// left 0.25, right -0.25: mean 0, right minus left -0.5.
+	if edit.Amplification != 0 || edit.Balance != -0.5 {
+		t.Errorf("controls %v %v", edit.Amplification, edit.Balance)
 	}
 	if edit.Dirty || edit.Draft != base {
 		t.Error("draft changed itself")
@@ -398,15 +390,18 @@ func TestEditMapping(t *testing.T) {
 	if edit.Draft.LeftAmplification != 0.5 || edit.Draft.RightAmplification != 1.5 {
 		t.Errorf("gains %v %v", edit.Draft.LeftAmplification, edit.Draft.RightAmplification)
 	}
-	if !edit.EditAmplification(0) || edit.Draft.LeftAmplification != -1.5 || edit.Draft.RightAmplification != -0.5 {
+	if !edit.EditAmplification(-0.5) || edit.Draft.LeftAmplification != -1 || edit.Draft.RightAmplification != 0 {
 		t.Errorf("gains %v %v", edit.Draft.LeftAmplification, edit.Draft.RightAmplification)
 	}
-	for _, bad := range []float32{-0.1, 1.1, float32(math.NaN())} {
+	if !edit.EditAmplification(0) || !edit.EditBalance(-3) || edit.Draft.LeftAmplification != 1.5 || edit.Draft.RightAmplification != -1.5 {
+		t.Errorf("full balance: %v %v", edit.Draft.LeftAmplification, edit.Draft.RightAmplification)
+	}
+	for _, bad := range []float32{-1.6, 1.6, float32(math.NaN())} {
 		if edit.EditAmplification(bad) {
 			t.Errorf("amplification %v", bad)
 		}
 	}
-	if edit.EditBalance(1.5) {
+	if edit.EditBalance(3.5) || edit.EditBalance(float32(math.Inf(1))) {
 		t.Error("balance")
 	}
 	if edit.EditTone(1.5) || !edit.EditTone(-0.5) || edit.Draft.LeftTone != -0.5 || edit.Draft.RightTone != -0.5 {
@@ -420,18 +415,29 @@ func TestEditMapping(t *testing.T) {
 	}
 }
 
-func TestEditClampsGainsAtTheStoredLimits(t *testing.T) {
+// An ear that would leave -1.5 to 1.5 rejects the edit; nothing is clamped, so the balance
+// asked for is never silently changed.
+func TestEditRejectsAnEarOutOfRange(t *testing.T) {
 	base, _ := parseSettings(sim.HearingRecord())
 	base.LeftAmplification, base.RightAmplification = 1.5, 1.5
 	edit := NewProfileEdit(Profile{Settings: base, Editable: true})
-	if edit.Amplification != 1 || edit.Balance != 0 {
-		t.Errorf("sliders %v %v", edit.Amplification, edit.Balance)
+	if edit.Amplification != 1.5 || edit.Balance != 0 {
+		t.Errorf("controls %v %v", edit.Amplification, edit.Balance)
 	}
-	if !edit.EditBalance(-1) {
-		t.Fatal("balance")
+	if edit.EditBalance(-1) {
+		t.Error("an ear at 2 was accepted")
+	}
+	if edit.Draft != base || edit.Dirty || edit.Balance != 0 {
+		t.Errorf("a rejected edit changed the draft: %+v", edit)
+	}
+	if !edit.EditAmplification(1) || !edit.EditBalance(-1) {
+		t.Fatal("in range")
 	}
 	if edit.Draft.LeftAmplification != 1.5 || edit.Draft.RightAmplification != 0.5 {
 		t.Errorf("gains %v %v", edit.Draft.LeftAmplification, edit.Draft.RightAmplification)
+	}
+	if edit.EditAmplification(1.25) || edit.Amplification != 1 {
+		t.Error("left would be 1.75")
 	}
 }
 

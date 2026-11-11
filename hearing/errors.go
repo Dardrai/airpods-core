@@ -38,15 +38,6 @@ func refuse(format string, args ...any) error {
 	return &Refused{Reason: fmt.Sprintf(format, args...)}
 }
 
-// noted adds an outcome to an error while keeping its type visible to errors.As.
-type noted struct {
-	err  error
-	note string
-}
-
-func (n *noted) Error() string { return n.err.Error() + " " + n.note }
-func (n *noted) Unwrap() error { return n.err }
-
 // unconfirmed reports a write that went out with no proof of its effect.
 func unconfirmed(message string, cause error) error {
 	return &dongle.Unconfirmed{Message: message, Err: cause}

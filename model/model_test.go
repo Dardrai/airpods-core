@@ -169,3 +169,29 @@ func TestNeedsAllowOffResend(t *testing.T) {
 		}
 	}
 }
+
+// Gain Swipe (0x2f) exists on AirPods Pro 2 and 3, EN 352 protection (0x37) on Pro 3 only, as
+// the dongle's model masks say. Both need a report before they can be written.
+func TestPro2AndPro3Controls(t *testing.T) {
+	for _, model := range []string{"A2931", "A2699", "A2698", "A3047", "A3048", "A3049", "A3063", "A3064", "A3065"} {
+		p, _ := Find(model)
+		pro3 := p.Family == familyPro3
+		if !p.HasControl(0x2f) || p.HasControl(0x37) != pro3 {
+			t.Errorf("%s: gain swipe %v, en352 %v", model, p.HasControl(0x2f), p.HasControl(0x37))
+		}
+		if v := view(model, "9A348", map[byte]uint32{}); v.CanChoose(0x2f) || v.CanChoose(0x37) {
+			t.Errorf("%s: chosen without a report", model)
+		}
+	}
+	for i := range profiles {
+		if p := &profiles[i]; p.Family != familyPro2 && p.Family != familyPro3 && (p.HasControl(0x2f) || p.HasControl(0x37)) {
+			t.Errorf("%s lists a Pro control", p.Name)
+		}
+	}
+	if !view("A3063", "9A348", map[byte]uint32{0x37: 1}).SupportsControl(0x37) || view("A2931", "9A348", map[byte]uint32{0x37: 1}).SupportsControl(0x37) {
+		t.Error("en352 support")
+	}
+	if view("future", "9A348", map[byte]uint32{0x2f: 1}).SupportsControl(0x2f) {
+		t.Error("an unlisted model never shows gain swipe")
+	}
+}

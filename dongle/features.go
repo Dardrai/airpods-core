@@ -20,6 +20,27 @@ const (
 
 var gameModeStates = [...]string{"off", "pending", "unconfirmed", "confirmed", "failed", "unsupported", "restoring"}
 
+// Game Mode phases (AudioState.GameModePhase), byte 13 of the audio state.
+const (
+	GameModeOff         byte = iota // off, or turned off and confirmed
+	GameModePending                 // requested; waits for playback before it is sent
+	GameModeUnconfirmed             // sent; no fresh delay report from the AirPods yet
+	GameModeConfirmed               // on, confirmed by a fresh delay report
+	GameModeFailed
+	GameModeUnsupported
+	GameModeRestoring // turning off
+)
+
+var gameModeLabels = [...]string{"off", "waiting for playback", "unconfirmed", "on", "failed", "unsupported", "turning off"}
+
+// GameModeLabel names a Game Mode phase for people, as the firmware's own tool does.
+func GameModeLabel(phase byte) string {
+	if int(phase) < len(gameModeLabels) {
+		return gameModeLabels[phase]
+	}
+	return "unknown"
+}
+
 // AudioState is the kind 9 reply. Requested and actual codec and bitrate are separate.
 type AudioState struct {
 	RequestedCodec        byte
@@ -27,13 +48,14 @@ type AudioState struct {
 	Variable              bool
 	RequestedBitrate      uint32
 	Bitrate               uint32
-	GameModeRequested     bool
-	GameModeState         string
-	Input                 byte
-	Pending               bool
+	GameModeRequested     bool   // the preference: byte 12
+	GameModePhase         byte   // GameModeOff to GameModeRestoring: byte 13
+	GameModeState         string // the phase as a word: off, pending, unconfirmed, confirmed, failed, unsupported, restoring
+	Input                 byte   // 0 idle, 1 USB, 2 phone
+	Pending               bool   // a profile change is pending
 	Streaming             bool
 	MicrophoneActive      bool
-	GameModeSupported     bool
+	GameModeSupported     bool    // Game Mode can be turned on over this connection
 	ReportedDelayTenthsMs *uint16 // nil when the dongle reports no delay
 	PrimingMs             uint16
 }
@@ -52,6 +74,7 @@ func DecodeAudioState(b []byte) (AudioState, error) {
 		RequestedBitrate:  le.Uint32(b[4:]),
 		Bitrate:           le.Uint32(b[8:]),
 		GameModeRequested: b[12] == 1,
+		GameModePhase:     b[13],
 		GameModeState:     gameModeStates[b[13]],
 		Input:             b[14],
 		Pending:           b[15]&1 != 0,
@@ -123,7 +146,10 @@ func (c *Client) SetAudioProfile(codec byte, variable bool, bitrate uint32) (Aud
 	return DecodeAudioState(reply)
 }
 
-// SetGameMode toggles game mode (kind 4) and returns the reported audio state.
+// SetGameMode toggles game mode (kind 4) and returns the reported audio state. Acceptance is not
+// confirmation: on is confirmed once AudioState reads GameModeConfirmed, off at GameModeOff, and
+// on stays GameModePending without playback. A GameModeRequested that no longer matches means
+// another choice replaced this one.
 func (c *Client) SetGameMode(enabled bool) (AudioState, error) {
 	request := []byte{kindSetGameMode, 0}
 	if enabled {

@@ -512,3 +512,18 @@ func (d *closingDevice) Set(data [hid.ReportSize]byte) error {
 	}
 	return d.Device.Set(data)
 }
+
+func TestGameModePhase(t *testing.T) {
+	reply := make([]byte, 20)
+	reply[0], reply[12], reply[13], reply[15] = 1, 1, GameModePending, 8
+	reply[18] = 100
+	state, err := DecodeAudioState(reply)
+	if err != nil || !state.GameModeRequested || state.GameModePhase != GameModePending || state.GameModeState != "pending" || !state.GameModeSupported {
+		t.Fatalf("%+v %v", state, err)
+	}
+	for phase, want := range map[byte]string{GameModeOff: "off", GameModePending: "waiting for playback", GameModeConfirmed: "on", GameModeRestoring: "turning off", 7: "unknown"} {
+		if got := GameModeLabel(phase); got != want {
+			t.Errorf("%d: %q", phase, got)
+		}
+	}
+}

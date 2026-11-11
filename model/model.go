@@ -27,7 +27,8 @@ const (
 )
 
 var (
-	pro2Controls = []byte{0x01, 0x0a, 0x0d, 0x16, 0x17, 0x18, 0x1a, 0x1b, 0x1f, 0x20, 0x23, 0x24, 0x25, 0x26, 0x28, 0x2e, 0x31, 0x34, 0x35, 0x36, 0x3b, 0x40}
+	pro2Controls = []byte{0x01, 0x0a, 0x0d, 0x16, 0x17, 0x18, 0x1a, 0x1b, 0x1f, 0x20, 0x23, 0x24, 0x25, 0x26, 0x28, 0x2e, 0x2f, 0x31, 0x34, 0x35, 0x36, 0x3b, 0x40}
+	pro3Controls = []byte{0x01, 0x0a, 0x0d, 0x16, 0x17, 0x18, 0x1a, 0x1b, 0x1f, 0x20, 0x23, 0x24, 0x25, 0x26, 0x28, 0x2e, 0x2f, 0x31, 0x34, 0x35, 0x36, 0x37, 0x3b, 0x40}
 	maxControls  = []byte{0x0a, 0x0d, 0x1a, 0x1c, 0x1f, 0x20, 0x24, 0x3b}
 	max2Controls = []byte{0x0a, 0x0d, 0x1a, 0x1c, 0x1f, 0x20, 0x24, 0x26, 0x28, 0x2e, 0x35, 0x3b}
 	airPods5     = []byte{0x01, 0x0a, 0x0d, 0x16, 0x17, 0x18, 0x1a, 0x1b, 0x1f, 0x20, 0x24, 0x26, 0x28, 0x2e, 0x35, 0x3b}
@@ -55,12 +56,12 @@ var profiles = []Profile{
 	{Models: []string{"A3047", "A3048", "A3049"}, Name: "AirPods Pro 2 (USB-C)", Family: familyPro2, Listening: true, Adaptive: true, AllowOffOption: true, HighQualityMic: true, CustomEQ: true, HearingAid: true, CustomTransparency: true, LoudSoundReduction: true,
 		Controls: pro2Controls},
 	{Models: []string{"A3063", "A3064", "A3065"}, Name: "AirPods Pro 3", Family: familyPro3, Listening: true, Adaptive: true, AllowOffOption: true, HighQualityMic: true, CustomEQ: true, HearingAid: true, CustomTransparency: true, LoudSoundReduction: true,
-		Controls: pro2Controls},
+		Controls: pro3Controls},
 	{Models: []string{"A2096"}, Name: "AirPods Max (Lightning)", Family: "airpods_max", Headphone: true, Listening: true,
 		Controls: maxControls},
 	{Models: []string{"A3184"}, Name: "AirPods Max (USB-C)", Family: "airpods_max", Headphone: true, Listening: true,
 		Controls: maxControls},
-	{Models: []string{"A3454"}, Name: "AirPods Max 2", Family: "airpods_max", Headphone: true, Listening: true, Adaptive: true, HighQualityMic: true, CustomEQ: true, LoudSoundReduction: true,
+	{Models: []string{"A3454"}, Name: "AirPods Max 2", Family: "airpods_max", Headphone: true, Listening: true, Adaptive: true, HighQualityMic: true, CustomEQ: true,
 		Controls: max2Controls},
 	{Models: []string{"A3157"}, Name: "Powerbeats Pro 2", Family: "powerbeats_pro_2", Listening: true,
 		Controls: []byte{0x0a, 0x0d}},

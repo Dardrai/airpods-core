@@ -167,6 +167,20 @@ type Config struct {
 	// RoutingBusy refuses routing handovers as busy, as a call, a codec change or a
 	// Game Mode write in flight would.
 	RoutingBusy bool `json:"routing_busy"`
+
+	// ReconnectPolicy is the saved reconnect policy of kind 23: 0 Manual, 1 Automatic. Under
+	// Automatic, a routing read that finds the AirPods not connected and not released is
+	// followed by an automatic reconnect attempt, which advances the routing revision.
+	ReconnectPolicy byte `json:"reconnect_policy"`
+	// ReconnectPolicyUnsupported refuses kind 23 as unsupported, as firmware before 0.1.63
+	// does, or a dongle whose saved policy is unreadable.
+	ReconnectPolicyUnsupported bool `json:"reconnect_policy_unsupported"`
+	// ReconnectPolicyWriteFails fails a policy save with code 6, as an unverified flash write
+	// does; the dongle then acts as Manual and reads the policy as unsupported.
+	ReconnectPolicyWriteFails bool `json:"reconnect_policy_write_fails"`
+	// LegacySnapshotOnly answers the extended settings snapshot [2 1] as malformed and refuses
+	// writes of en352-protection and gain-swipe, as firmware before 0.1.64 does.
+	LegacySnapshotOnly bool `json:"legacy_snapshot_only"`
 }
 
 // CachedReport is one kept report: how old it is, its reception revision and its packet.
@@ -250,6 +264,8 @@ type Device struct {
 	allowOffGeneration uint32
 
 	routing routingState
+
+	policyFailed bool // a policy save failed; the policy reads as unsupported
 }
 
 // New builds a device from a config.
@@ -651,7 +667,7 @@ func (d *Device) respond() ([]byte, byte) {
 			return nil, 3
 		}
 		if d.stagedOp == 2 {
-			if !d.cfg.AnyAAP && !aapAllowed(request) {
+			if !d.cfg.AnyAAP && !d.aapAllowed(request) {
 				return nil, 6 // The dongle sends only the packets it knows; nothing went out.
 			}
 			d.aapSent = append(d.aapSent, append([]byte(nil), request...))
@@ -668,7 +684,11 @@ func (d *Device) respond() ([]byte, byte) {
 	}
 	kind := request[0]
 	if kind == 2 {
-		return d.snapshot()
+		extended := len(request) == 2 && request[1] == 1
+		if len(request) != 1 && (!extended || d.cfg.LegacySnapshotOnly) {
+			return nil, 1
+		}
+		return d.snapshot(extended)
 	}
 	if kind == 1 {
 		return d.writeSetting(request)
@@ -695,6 +715,8 @@ func (d *Device) respond() ([]byte, byte) {
 	switch kind {
 	case 20, 21:
 		return d.routingRequest(request)
+	case 23:
+		return d.reconnectPolicy(request)
 	case 3, 4, 9:
 		return defaultAudio(), 0
 	case 5:
@@ -719,15 +741,15 @@ func (d *Device) respond() ([]byte, byte) {
 
 // cachedReply is the envelope of a kept report, empty when the slot holds nothing.
 func (d *Device) cachedReply(request []byte) ([]byte, byte) {
-	if len(request) != 1 || request[0] < 1 || request[0] > 6 {
-		return nil, 1
+	if len(request) != 1 || request[0] < 1 || request[0] > 7 {
+		return nil, 7
 	}
 	if request[0] == 6 {
 		// Slot 6 is the settings snapshot itself, empty until controls are ready.
 		if d.cfg.Flags&2 == 0 {
 			return nil, 0
 		}
-		return d.snapshotBytes(), 0
+		return d.snapshotBytes(false), 0
 	}
 	report, ok := d.cfg.Cached[request[0]]
 	if !ok {
@@ -738,7 +760,7 @@ func (d *Device) cachedReply(request []byte) ([]byte, byte) {
 	return append(out, report.Packet...), 0
 }
 
-func (d *Device) snapshot() ([]byte, byte) {
+func (d *Device) snapshot(extended bool) ([]byte, byte) {
 	if d.written && d.cfg.SnapshotFailAfterWrite != 0 {
 		return nil, d.cfg.SnapshotFailAfterWrite
 	}
@@ -757,17 +779,27 @@ func (d *Device) snapshot() ([]byte, byte) {
 		}
 	}
 	d.snapshotReads++
-	return d.snapshotBytes(), 0
+	return d.snapshotBytes(extended), 0
 }
 
-// snapshotBytes encodes the settings the dongle has received so far.
-func (d *Device) snapshotBytes() []byte {
+// extendedOnly lists the settings only the extended snapshot [2 1] carries.
+func extendedOnly(control byte) bool { return control == 0x37 || control == 0x2f }
+
+// snapshotBytes encodes the settings the dongle has received so far. The legacy snapshot,
+// also kept in slot 6, leaves out the settings added in firmware 0.1.64.
+func (d *Device) snapshotBytes(extended bool) []byte {
 	settings := d.cfg.Settings
 	if d.cfg.SettingsPerRead > 0 {
 		settings = settings[:min(len(settings), d.cfg.SettingsPerRead*max(d.snapshotReads, 1))]
 	}
-	out := []byte{1, byte(len(settings))}
+	var listed []Setting
 	for _, s := range settings {
+		if extended || !extendedOnly(s.Control) {
+			listed = append(listed, s)
+		}
+	}
+	out := []byte{1, byte(len(listed))}
+	for _, s := range listed {
 		out = append(out, s.Control)
 		out = binary.LittleEndian.AppendUint32(out, s.Age)
 		out = binary.LittleEndian.AppendUint32(out, s.Revision)
@@ -811,6 +843,10 @@ func (d *Device) writeSetting(request []byte) ([]byte, byte) {
 	}
 	control, value := request[1], binary.LittleEndian.Uint32(request[2:])
 	if d.cfg.AllowOffGate && d.offRefused(control, value) {
+		return nil, 7
+	}
+	if extendedOnly(control) && (d.cfg.LegacySnapshotOnly || !d.reported(control)) {
+		// The dongle writes these only once the AirPods have reported them.
 		return nil, 7
 	}
 	if control == 0x34 {
@@ -903,6 +939,41 @@ func (c *VirtualClock) Sleep(d time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.now = c.now.Add(d)
+}
+
+func (d *Device) reported(control byte) bool {
+	for _, s := range d.cfg.Settings {
+		if s.Control == control {
+			return true
+		}
+	}
+	return false
+}
+
+// reconnectPolicy serves kind 23: [23] reads the saved policy, [23 mode] saves it. A save is
+// busy while any settings lease is held, during playback or microphone use, and while a
+// takeover or release is under way.
+func (d *Device) reconnectPolicy(request []byte) ([]byte, byte) {
+	if len(request) > 2 || (len(request) == 2 && request[1] > 1) {
+		return nil, 1
+	}
+	if len(request) == 2 {
+		switch {
+		case d.leaseHeld, d.cfg.Flags&(4|16|64) != 0, d.routing.takeover, d.routing.closing:
+			return nil, 2
+		case d.cfg.ReconnectPolicyUnsupported:
+			return nil, 7
+		case d.cfg.ReconnectPolicyWriteFails:
+			// The save may have persisted, but the dongle no longer vouches for it.
+			d.cfg.ReconnectPolicy, d.policyFailed = request[1], true
+			return nil, 6
+		}
+		d.cfg.ReconnectPolicy, d.policyFailed = request[1], false
+	}
+	if d.cfg.ReconnectPolicyUnsupported || d.policyFailed {
+		return nil, 7
+	}
+	return []byte{1, d.cfg.ReconnectPolicy}, 0
 }
 
 // offRefused applies the Allow Off rule of AllowOffGate: Off needs allow-off on written in

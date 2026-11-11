@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"math"
+	"slices"
 	"time"
 
 	"github.com/Dardrai/airpods-core/dongle"
@@ -87,8 +89,15 @@ var (
 
 const pmeSize = 140
 
+// knownHearingPair accepts the enrolled and enabled bytes of a hearing report: enrolled (1)
+// with Hearing Aid on (1) or off (2), or not enrolled (2) with it unset (0) or off (2). Not
+// enrolled yet on, or enrolled with no state, is a report this app does not trust.
+func knownHearingPair(enrolled, enabled byte) bool {
+	return (enrolled == 1 && (enabled == 1 || enabled == 2)) || (enrolled == 2 && (enabled == 0 || enabled == 2))
+}
+
 func hearingReport(packet []byte) []byte {
-	if len(packet) == 11 && bytes.HasPrefix(packet, prefixHearing) && packet[7] <= 2 && packet[8] <= 2 && packet[9] == 0 && packet[10] == 0 {
+	if len(packet) == 11 && bytes.HasPrefix(packet, prefixHearing) && knownHearingPair(packet[7], packet[8]) && packet[9] == 0 && packet[10] == 0 {
 		return bytes.Clone(packet)
 	}
 	return nil
@@ -101,26 +110,30 @@ func assistReport(packet []byte) Flag {
 	return FlagUnknown
 }
 
+// pmeReport accepts a media assist record with both enable flags set and finite curves.
 func pmeReport(packet []byte) []byte {
-	if len(packet) == pmeSize && bytes.HasPrefix(packet, headerPME) && packet[9] <= 2 && packet[10] <= 2 && packet[11] <= 2 {
-		return bytes.Clone(packet)
+	if len(packet) != pmeSize || !bytes.HasPrefix(packet, headerPME) || packet[9] > 2 ||
+		wireFlag(packet[10]) == FlagUnknown || wireFlag(packet[11]) == FlagUnknown {
+		return nil
 	}
-	return nil
+	for offset := 12; offset < pmeSize; offset += 4 {
+		if v := float64(floatAt(packet, offset)); math.IsNaN(v) || math.IsInf(v, 0) {
+			return nil
+		}
+	}
+	return bytes.Clone(packet)
 }
 
-// hearingEnabled treats an unset enabled byte as off only when not enrolled.
+// hearingEnabled reads a report hearingReport accepted; any state but on is off.
 func hearingEnabled(packet []byte) Flag {
 	if packet == nil {
 		return FlagUnknown
 	}
-	enrolled, enabled := packet[7], packet[8]
-	if enrolled == 2 && enabled == 0 {
-		return FlagOff
-	}
-	if (enrolled == 1 || enrolled == 2) && (enabled == 1 || enabled == 2) {
-		return boolFlag(enrolled == 1 && enabled == 1)
-	}
-	return FlagUnknown
+	return boolFlag(packet[8] == 1)
+}
+
+func allZero(value []byte) bool {
+	return !slices.ContainsFunc(value, func(b byte) bool { return b != 0 })
 }
 
 // modeCache holds the latest reports and, separately, the last good packets. A template
@@ -271,15 +284,20 @@ func planMode(cache *modeCache, mode Mode, on bool) (*ModePlan, error) {
 	return plan, nil
 }
 
-// confirmed needs the cache to hold fresh reports of everything the plan intended.
+// confirmed needs the cache to hold fresh reports of everything the plan intended, with the
+// enrollment and the media assist curves unchanged. A Hearing Aid change that leaves both media
+// assist flags off may also see the curves filled in or cleared: when either side is all zero,
+// they are not in use.
 func (p *ModePlan) confirmed(cache *modeCache) bool {
 	if cache.hearing == nil || cache.hearing[7] != p.enrollment || cache.pme == nil {
 		return false
 	}
 	state := cache.state()
+	inactiveCurves := p.Mode == HearingAid && p.voice == FlagOff && p.media == FlagOff &&
+		(allZero(p.pme[12:]) || allZero(cache.pme[12:]))
 	return state.HearingEnabled == p.hearing && state.AssistEnabled == p.gate &&
 		state.VoiceEnabled == p.voice && state.PMEMediaEnabled == p.media &&
-		bytes.Equal(cache.pme[8:10], p.pme[8:10]) && bytes.Equal(cache.pme[12:], p.pme[12:])
+		bytes.Equal(cache.pme[8:10], p.pme[8:10]) && (bytes.Equal(cache.pme[12:], p.pme[12:]) || inactiveCurves)
 }
 
 func slotOf(packet []byte) (byte, bool) {
@@ -295,7 +313,7 @@ func slotOf(packet []byte) (byte, bool) {
 }
 
 const (
-	confirmLimit = 15 * time.Second
+	confirmLimit = 8 * time.Second
 	confirmPoll  = 100 * time.Millisecond
 )
 
@@ -476,7 +494,7 @@ func (m *Modes) Plan(mode Mode, on bool) (*ModePlan, error) {
 func (m *Modes) Recovery() *Recovery { return m.recovery }
 
 // Set turns Hearing Aid or Media Assist on or off, without writing the stored profile. It is
-// StartSet followed by Step until done, blocking for up to 15 s with exclusive use of the
+// StartSet followed by Step until done, blocking for up to 8 s with exclusive use of the
 // client. An app with a device owner goroutine that also polls should not run it as one job:
 // use StartSet and one job per Step instead. The checks and the outcomes are those of StartSet.
 func (m *Modes) Set(c *dongle.Client, mode Mode, on bool) (*ModeResult, error) {
@@ -488,7 +506,7 @@ func (m *Modes) Set(c *dongle.Client, mode Mode, on bool) (*ModeResult, error) {
 }
 
 // Recover turns off the mode named by Recovery. It is StartRecover followed by Step until
-// done, blocking for up to 15 s as Set does.
+// done, blocking for up to 8 s as Set does.
 func (m *Modes) Recover(c *dongle.Client) (*ModeResult, error) {
 	change, err := m.StartRecover(c)
 	if err != nil {
@@ -503,8 +521,9 @@ func (m *Modes) Recover(c *dongle.Client) (*ModeResult, error) {
 // the checks comes back as it is, also before any packet:
 //   - the model must have hearing assistance;
 //   - enabling needs enrollment and complete, consistent mode reports;
-//   - enabling reads the stored profile first, and refuses unless Custom Transparency is
-//     known to be off (skipped only for Hearing Aid when it is already reported on);
+//   - enabling reads the stored profile first and refuses unless it is a writable saved
+//     fitting, then refuses unless Custom Transparency is known to be off (skipped only for
+//     Hearing Aid when it is already reported on);
 //   - the reports must not change during those reads;
 //   - no other change on this Modes may be under way.
 //
@@ -573,6 +592,9 @@ func (m *Modes) startChange(o *operation, mode Mode, on bool) (*ModeChange, erro
 		_, value, _, err := readSettings(o.Exchange)
 		if err != nil {
 			return nil, err
+		}
+		if value[1] != 2 {
+			return nil, refuse("These AirPods have no writable saved hearing profile, so hearing assistance stays as it is. Set it up from an iPhone or iPad.")
 		}
 		if mode == MediaAssist || initial.HearingEnabled != FlagOn {
 			if err := requireCleanTransparency(o.Exchange); err != nil {
@@ -664,7 +686,7 @@ func (ch *ModeChange) wait(c *dongle.Client) (*ModeResult, error) {
 // Step looks once at the change and returns without waiting. done means it has ended: a nil
 // error says the AirPods reported the planned state with new reception revisions and, after an
 // enable, that the stored profile read back byte for byte. A connection that changes, a
-// recording that starts or a failed read ends it as a *ModeUnconfirmed, as does the 15 s limit.
+// recording that starts or a failed read ends it as a *ModeUnconfirmed, as does the 8 s limit.
 // Another client holding the channel only delays the look, within that limit. It sends nothing
 // to the AirPods. Run it on the device owner goroutine, every 100 ms or more.
 func (ch *ModeChange) Step(c *dongle.Client) (*ModeResult, bool, error) {

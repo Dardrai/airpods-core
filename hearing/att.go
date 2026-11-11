@@ -94,7 +94,7 @@ func discover(exchange Exchanger, wanted []UUID, name string, required byte) ([]
 		return found, nil
 	}
 	if len(service) != 5 || service[0] != attFound {
-		return nil, fmt.Errorf("%s service discovery failed.", name)
+		return nil, attFailure(name+" service discovery failed.", request, service)
 	}
 	le := binary.LittleEndian
 	start, end := le.Uint16(service[1:]), le.Uint16(service[3:])
@@ -102,6 +102,7 @@ func discover(exchange Exchanger, wanted []UUID, name string, required byte) ([]
 		return nil, fmt.Errorf("%s service range is invalid.", name)
 	}
 	var previousValue uint16
+	seen := map[UUID]bool{} // Any characteristic listed twice makes the whole service untrustworthy.
 	for range 16 {
 		request := []byte{attByType, byte(start), byte(start >> 8), byte(end), byte(end >> 8), 0x03, 0x28}
 		response, err := exchange(request)
@@ -112,7 +113,7 @@ func discover(exchange Exchanger, wanted []UUID, name string, required byte) ([]
 			return found, nil
 		}
 		if len(response) < 2 || response[0] != attByTypeR || (response[1] != 7 && response[1] != 21) {
-			return nil, fmt.Errorf("%s characteristic discovery failed.", name)
+			return nil, attFailure(name+" characteristic discovery failed.", request, response)
 		}
 		each, entries := int(response[1]), response[2:]
 		if len(entries) == 0 || len(entries)%each != 0 {
@@ -124,6 +125,12 @@ func discover(exchange Exchanger, wanted []UUID, name string, required byte) ([]
 			declaration, handle := le.Uint16(entry), le.Uint16(entry[3:])
 			if declaration <= previous || declaration <= previousValue || declaration > end || handle <= declaration || handle > end {
 				return nil, fmt.Errorf("%s characteristic range is invalid.", name)
+			}
+			if each == 21 {
+				if seen[UUID(entry[5:])] {
+					return nil, fmt.Errorf("%s discovery found a characteristic listed twice.", name)
+				}
+				seen[UUID(entry[5:])] = true
 			}
 			for index, uuid := range wanted {
 				if !bytes.Equal(entry[5:], uuid[:]) {
@@ -160,23 +167,65 @@ func DiscoverRead(exchange Exchanger, name string, wanted ...UUID) ([]*Character
 	return discover(exchange, wanted, name, propRead)
 }
 
-func errorText(context string, response []byte) error {
-	if len(response) == 5 && response[0] == attError {
-		return fmt.Errorf("%s ATT request 0x%02X, handle 0x%04X, error 0x%02X.", context, response[1], binary.LittleEndian.Uint16(response[2:]), response[4])
+// answers reports whether an ATT error reply belongs to request: it must name the request's
+// opcode, and its handle must be the request's handle or, for a search, lie inside its range.
+func answers(request, response []byte) bool {
+	if len(response) != 5 || response[0] != attError || len(request) < 3 || response[1] != request[0] {
+		return false
 	}
-	return errors.New(context)
+	le := binary.LittleEndian
+	start, handle := le.Uint16(request[1:]), le.Uint16(response[2:])
+	end := start
+	if (request[0] == attFindType || request[0] == attByType) && len(request) >= 5 {
+		end = le.Uint16(request[3:])
+	}
+	return handle >= start && handle <= end
+}
+
+// attFailure words a reply to request that is not the one expected. An ATT error is quoted
+// only when it answers this request; one that names another request or handle says so.
+func attFailure(context string, request, response []byte) error {
+	if len(response) == 0 || response[0] != attError {
+		return errors.New(context)
+	}
+	if !answers(request, response) {
+		return fmt.Errorf("%s The AirPods answered a different ATT request.", context)
+	}
+	return fmt.Errorf("%s ATT request 0x%02X, handle 0x%04X, error 0x%02X.", context, response[1], binary.LittleEndian.Uint16(response[2:]), response[4])
 }
 
 func readRequest(handle uint16) []byte { return []byte{attRead, byte(handle), byte(handle >> 8)} }
 
-// readValue reads an attribute's value.
+// maxReadValue is the longest attribute value a read may return; a read must return at least
+// one byte.
+const maxReadValue = 510
+
+// readValue reads an attribute's value, which must be 1 to maxReadValue bytes.
 func readValue(exchange Exchanger, handle uint16, context string) ([]byte, error) {
-	response, err := exchange(readRequest(handle))
+	request := readRequest(handle)
+	response, err := exchange(request)
 	if err != nil {
 		return nil, err
 	}
 	if len(response) < 1 || response[0] != attReadR {
-		return nil, errorText(context, response)
+		return nil, attFailure(context, request, response)
+	}
+	if len(response) < 2 || len(response) > maxReadValue+1 {
+		return nil, fmt.Errorf("%s The AirPods returned a value of %d bytes.", context, len(response)-1)
 	}
 	return response[1:], nil
+}
+
+// writeRequest builds a write of value with the opcode the characteristic advertises.
+func writeRequest(c Characteristic, value []byte) []byte {
+	return append([]byte{c.WriteOpcode, byte(c.Handle), byte(c.Handle >> 8)}, value...)
+}
+
+// writeAcknowledged checks the reply to a write: a write request must answer with exactly the
+// write response, a write command with nothing at all.
+func writeAcknowledged(context string, request, response []byte) error {
+	if request[0] == attWrite && bytes.Equal(response, []byte{attWriteR}) || request[0] == attCommand && len(response) == 0 {
+		return nil
+	}
+	return attFailure(context, request, response)
 }

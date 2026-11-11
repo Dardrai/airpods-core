@@ -121,7 +121,7 @@ func TestHoldActionsLeftIsLowByte(t *testing.T) {
 }
 
 func TestExtraSettings(t *testing.T) {
-	for name, control := range map[string]byte{"connect-automatically": 0x20, "allow-auto-connect": 0x36} {
+	for name, control := range map[string]byte{"connect-automatically": 0x20, "allow-auto-connect": 0x36, "en352-protection": 0x37, "gain-swipe": 0x2f} {
 		if _, ok := LookupSetting(name); ok {
 			t.Errorf("%s is in the CLI table", name)
 		}

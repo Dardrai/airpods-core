@@ -28,7 +28,26 @@ type ATTServer struct {
 	// LastWrite is the opcode and value of the last write, for tests.
 	LastWrite []byte
 	Writes    int
+	// Fault breaks characteristic discovery the way a faulty peer or dongle could.
+	Fault DiscoveryFault
 }
+
+// DiscoveryFault is a way characteristic discovery can go wrong.
+type DiscoveryFault int
+
+// Discovery faults. Each one makes every lookup in the service fail.
+const (
+	DiscoveryOK DiscoveryFault = iota
+	// DiscoveryTruncated cuts the last byte off the characteristic list.
+	DiscoveryTruncated
+	// DiscoveryDuplicate lists the last characteristic twice, under two declarations.
+	DiscoveryDuplicate
+	// DiscoveryOutOfRange gives the last characteristic a value handle past the service end.
+	DiscoveryOutOfRange
+	// DiscoveryForeignError answers the characteristic search with an error that names a
+	// handle outside the request.
+	DiscoveryForeignError
+)
 
 func attErrorReply(op byte, handle uint16, code byte) []byte {
 	return []byte{1, op, byte(handle), byte(handle >> 8), code}
@@ -49,6 +68,9 @@ func (s *ATTServer) range16() (uint16, uint16) {
 	if n := len(s.Attributes); n > 0 {
 		first, last = s.Attributes[0].Handle-2, s.Attributes[n-1].Handle
 	}
+	if s.Fault == DiscoveryDuplicate {
+		last += 2
+	}
 	return first, last
 }
 
@@ -57,10 +79,14 @@ func (s *ATTServer) Handle(pdu []byte) []byte {
 	if len(pdu) == 0 {
 		return nil
 	}
-	if s.Unreachable {
-		return attErrorReply(pdu[0], 0, 0x0e)
-	}
 	le := binary.LittleEndian
+	if s.Unreachable {
+		handle := uint16(0)
+		if len(pdu) >= 3 {
+			handle = le.Uint16(pdu[1:]) // An error names the handle of the request it answers.
+		}
+		return attErrorReply(pdu[0], handle, 0x0e)
+	}
 	first, last := s.range16()
 	switch pdu[0] {
 	case 0x06:
@@ -72,17 +98,33 @@ func (s *ATTServer) Handle(pdu []byte) []byte {
 		return attErrorReply(0x06, le.Uint16(pdu[1:]), 0x0a)
 	case 0x08:
 		start := le.Uint16(pdu[1:])
+		if s.Fault == DiscoveryForeignError {
+			return attErrorReply(0x08, 0xffff, 0x0a)
+		}
 		out := []byte{0x09, 21}
+		var lastEntry []byte
 		for _, a := range s.Attributes {
 			if a.Handle-1 >= start {
-				out = le.AppendUint16(out, a.Handle-1)
-				out = append(out, a.Props)
-				out = le.AppendUint16(out, a.Handle)
-				out = append(out, a.UUID[:]...)
+				lastEntry = le.AppendUint16(nil, a.Handle-1)
+				lastEntry = append(lastEntry, a.Props)
+				lastEntry = le.AppendUint16(lastEntry, a.Handle)
+				lastEntry = append(lastEntry, a.UUID[:]...)
+				out = append(out, lastEntry...)
 			}
 		}
 		if len(out) == 2 {
 			return attErrorReply(0x08, start, 0x0a)
+		}
+		switch s.Fault {
+		case DiscoveryTruncated:
+			out = out[:len(out)-1]
+		case DiscoveryDuplicate:
+			dup := append([]byte(nil), lastEntry...)
+			le.PutUint16(dup, last-1)
+			le.PutUint16(dup[3:], last)
+			out = append(out, dup...)
+		case DiscoveryOutOfRange:
+			le.PutUint16(out[len(out)-18:], last+1)
 		}
 		return out
 	case 0x0a:

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Dardrai/airpods-core/dongle"
 	"github.com/Dardrai/airpods-core/dongle/sim"
@@ -146,6 +147,7 @@ func TestEnableRefusals(t *testing.T) {
 			}
 			a.Server.Attributes = attributes
 		}, "Could not confirm Custom Transparency"},
+		{"unwritable stored profile", func(a *sim.HearingAirPods) { a.Server.Find(sim.UUIDHearing).Value[1] = 0 }, "no writable saved hearing profile"},
 		{"no stored profile", func(a *sim.HearingAirPods) {
 			attributes := a.Server.Attributes[:0]
 			for _, attribute := range a.Server.Attributes {
@@ -389,5 +391,143 @@ func TestUUIDWireOrder(t *testing.T) {
 	want := []byte{0x90, 0x53, 0x4d, 0x74, 0xaf, 0x9e, 0x03, 0x94, 0xdb, 0x45, 0xab, 0xf7, 0xc1, 0x1c, 0x62, 0xd5}
 	if !bytes.Equal(transparencyUUID[:], want) {
 		t.Errorf("transparency %x", transparencyUUID)
+	}
+}
+
+// Custom Transparency off can also come as the 100 byte record or the 4 byte unset record.
+func TestEnableAcceptsEveryOffTransparencyRecord(t *testing.T) {
+	for name, value := range map[string][]byte{
+		"100 bytes": sim.ShortTransparencyRecord(false),
+		"unset":     sim.UnsetTransparencyRecord(),
+	} {
+		for _, mode := range []Mode{HearingAid, MediaAssist} {
+			t.Run(name+"/"+mode.String(), func(t *testing.T) {
+				a := proThree()
+				a.Server.Find(sim.UUIDTransparency).Value = value
+				client, _ := rig(t, a)
+				if _, err := new(Modes).Set(client, mode, true); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+	a := proThree()
+	a.Server.Find(sim.UUIDTransparency).Value = sim.ShortTransparencyRecord(true)
+	client, _ := rig(t, a)
+	_, err := new(Modes).Set(client, HearingAid, true)
+	refused(t, err, "Custom Transparency is on")
+	if len(a.Received) != 0 {
+		t.Errorf("sent %x", a.Received)
+	}
+}
+
+// Enrolled with no state, or not enrolled yet on, is a report nobody can act on.
+func TestInconsistentHearingReportsAreUnknown(t *testing.T) {
+	pme := sim.PMERecord()
+	pme[10] = 0
+	for name, slot := range map[string]sim.CachedReport{
+		"not enrolled but on": {Revision: 1, Packet: []byte{4, 0, 4, 0, 9, 0, 0x2c, 2, 1, 0, 0}},
+		"enrolled but unset":  {Revision: 1, Packet: []byte{4, 0, 4, 0, 9, 0, 0x2c, 1, 0, 0, 0}},
+		"enrollment unset":    {Revision: 1, Packet: []byte{4, 0, 4, 0, 9, 0, 0x2c, 0, 2, 0, 0}},
+		"media assist flag 0": {Revision: 1, Packet: pme},
+	} {
+		t.Run(name, func(t *testing.T) {
+			a := proThree()
+			slotNumber := byte(2)
+			if slot.Packet[4] == 0x53 {
+				slotNumber = 4
+			}
+			a.Slots[slotNumber] = slot
+			client, _ := rig(t, a)
+			modes := new(Modes)
+			state, err := modes.Read(client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if slotNumber == 2 && (state.HearingEnabled != FlagUnknown || state.HearingEnrolled != FlagUnknown) {
+				t.Errorf("state %+v", state)
+			}
+			if slotNumber == 4 && (state.VoiceEnabled != FlagUnknown || state.Media != FlagUnknown) {
+				t.Errorf("state %+v", state)
+			}
+			for _, mode := range []Mode{HearingAid, MediaAssist} {
+				for _, on := range []bool{true, false} {
+					if _, err := modes.Set(client, mode, on); err == nil {
+						t.Errorf("%s %v planned from an unknown state", mode, on)
+					}
+				}
+			}
+			if len(a.Received) != 0 {
+				t.Errorf("sent %x", a.Received)
+			}
+		})
+	}
+	// Not enrolled and unset is a real state: off.
+	a := proThree()
+	a.Slots[2] = sim.CachedReport{Revision: 1, Packet: []byte{4, 0, 4, 0, 9, 0, 0x2c, 2, 0, 0, 0}}
+	client, _ := rig(t, a)
+	if state, err := new(Modes).Read(client); err != nil || state.HearingEnabled != FlagOff || state.HearingEnrolled != FlagOff {
+		t.Errorf("state %+v %v", state, err)
+	}
+}
+
+// pmeWithCurves is the media assist record with every curve byte set to value.
+func pmeWithCurves(value byte) []byte {
+	packet := sim.PMERecord()
+	for i := 12; i < len(packet); i++ {
+		packet[i] = value
+	}
+	return packet
+}
+
+// Turning Hearing Aid off with both media assist flags off may clear or fill the curves.
+func TestHearingAidOffAcceptsClearedCurves(t *testing.T) {
+	start := func(t *testing.T, pme []byte, reported []byte) (*sim.HearingAirPods, error) {
+		t.Helper()
+		a := enabled()
+		a.Slots[4] = sim.CachedReport{Revision: 1, Packet: pme}
+		a.AfterAAP = func(pdu []byte) {
+			if bytes.Equal(pdu, hearingOff) {
+				a.Report(4, reported)
+			}
+		}
+		client, _ := rig(t, a)
+		_, err := new(Modes).Set(client, HearingAid, false)
+		return a, err
+	}
+	if _, err := start(t, sim.PMERecord(), pmeWithCurves(0)); err != nil {
+		t.Errorf("cleared curves: %v", err)
+	}
+	if _, err := start(t, pmeWithCurves(0), sim.PMERecord()); err != nil {
+		t.Errorf("filled curves: %v", err)
+	}
+	a, err := start(t, sim.PMERecord(), pmeWithCurves(0x3f))
+	var unconfirmed *ModeUnconfirmed
+	if !errors.As(err, &unconfirmed) {
+		t.Errorf("other curves: %v", err)
+	}
+	samePackets(t, a.Received, [][]byte{assistOff, hearingOff, askReports})
+	// With Media Assist on the curves are in use, so a cleared set is not accepted.
+	voice := sim.PMERecord()
+	voice[10] = 1
+	cleared := pmeWithCurves(0)
+	cleared[10] = 1
+	if _, err := start(t, voice, cleared); !errors.As(err, &unconfirmed) {
+		t.Errorf("curves in use: %v", err)
+	}
+}
+
+func TestModeConfirmationWaitsEightSeconds(t *testing.T) {
+	a := proThree()
+	a.Silent = true
+	client, _ := rig(t, a)
+	began := client.Clock().Now()
+	_, err := new(Modes).Set(client, HearingAid, true)
+	var unconfirmed *ModeUnconfirmed
+	if !errors.As(err, &unconfirmed) {
+		t.Fatalf("err %v", err)
+	}
+	if waited := client.Clock().Now().Sub(began); waited < 8*time.Second || waited > 9*time.Second {
+		t.Errorf("waited %v", waited)
 	}
 }
