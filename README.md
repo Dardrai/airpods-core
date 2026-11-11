@@ -104,7 +104,7 @@ as it is. Headphone Accommodations and its presets are not supported.
 ## Credits
 
 The apps and this library build on the work of [NTPods](https://github.com/Ripthulhu/ntpods) and
-[LibrePods](https://github.com/librepods-org/librepods).
+[LibrePods](https://github.com/Ripthulhu/librepods).
 
 Not affiliated with or endorsed by Apple. AirPods is a trademark of Apple Inc.
 
