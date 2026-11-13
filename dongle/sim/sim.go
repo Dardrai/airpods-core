@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -175,6 +177,10 @@ type Config struct {
 	// ReconnectPolicyUnsupported refuses kind 23 as unsupported, as firmware before 0.1.63
 	// does, or a dongle whose saved policy is unreadable.
 	ReconnectPolicyUnsupported bool `json:"reconnect_policy_unsupported"`
+	// Firmware is the version kind 24 reports, such as "0.1.67", with
+	// "-experimental-radio0076" for that build. Empty refuses kind 24 as unsupported, as
+	// firmware before the version report does.
+	Firmware string `json:"firmware"`
 	// ReconnectPolicyWriteFails fails a policy save with code 6, as an unverified flash write
 	// does; the dongle then acts as Manual and reads the policy as unsupported.
 	ReconnectPolicyWriteFails bool `json:"reconnect_policy_write_fails"`
@@ -717,6 +723,8 @@ func (d *Device) respond() ([]byte, byte) {
 		return d.routingRequest(request)
 	case 23:
 		return d.reconnectPolicy(request)
+	case 24:
+		return d.firmwareInfo(request)
 	case 3, 4, 9:
 		return defaultAudio(), 0
 	case 5:
@@ -1038,4 +1046,29 @@ func defaultDiagnostic(kind byte) []byte {
 		le.PutUint32(reply[i:], uint32(i))
 	}
 	return reply
+}
+
+// firmwareInfo serves kind 24 from Config.Firmware.
+func (d *Device) firmwareInfo(request []byte) ([]byte, byte) {
+	if len(request) != 1 {
+		return nil, 1
+	}
+	version, variant, _ := strings.Cut(d.cfg.Firmware, "-")
+	parts := strings.Split(version, ".")
+	if d.cfg.Firmware == "" || len(parts) != 3 {
+		return nil, 7
+	}
+	var n [3]int
+	for i, part := range parts {
+		v, err := strconv.Atoi(part)
+		if err != nil {
+			return nil, 7
+		}
+		n[i] = v
+	}
+	reply := []byte{1, byte(n[0]), byte(n[1]), byte(n[2]), byte(n[2] >> 8), 0}
+	if variant == "experimental-radio0076" {
+		reply[5] = 1
+	}
+	return reply, 0
 }
